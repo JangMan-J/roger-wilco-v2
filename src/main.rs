@@ -43,6 +43,14 @@ fn main() -> io::Result<()> {
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--hold-before-ack").map(PathBuf::from),
         ),
+        "adapter" => session::adapter(
+            PathBuf::from(need(&args, "--socket")?),
+            match arg(&args, "--id") {
+                Some(id) => id,
+                None => session::gen_uuid()?,
+            },
+            PathBuf::from(need(&args, "--store")?),
+        ),
         "send" => session::send(
             PathBuf::from(need(&args, "--socket")?),
             need(&args, "--from")?,
@@ -54,7 +62,7 @@ fn main() -> io::Result<()> {
             need(&args, "--body")?,
         ),
         _ => {
-            eprintln!("usage: roger <coordinator|daemon|session|send> [flags]");
+            eprintln!("usage: roger <coordinator|daemon|session|adapter|send> [flags]");
             std::process::exit(2);
         }
     }

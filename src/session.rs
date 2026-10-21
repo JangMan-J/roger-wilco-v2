@@ -10,11 +10,64 @@ use std::io::{self, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
+/// The Tracer: a session with no harness, reporting on its own stdout.
 pub fn run(
     socket: PathBuf,
     id: String,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
+) -> io::Result<()> {
+    serve(socket, id, store_path, hold_before_ack, None)
+}
+
+/// The adapter: the same session, fronted by one line-delimited JSON stream
+/// on stdin/stdout for a shim. The shim sends `{"type":"send","to","body"}`
+/// (optional `"mail"`) and is told `ready`, `accepted`, `error`, and `mail`.
+/// A `mail` line follows the Store write and never gates the ack: the shim
+/// renders what the adapter already holds and acknowledges nothing.
+pub fn adapter(socket: PathBuf, id: String, store_path: PathBuf) -> io::Result<()> {
+    let out = net::writer(Box::new(io::stdout()));
+    let (sock, me, to_shim) = (socket.clone(), id.clone(), out.clone());
+    std::thread::spawn(move || {
+        for line in net::lines(Box::new(io::stdin())) {
+            let reply = line.and_then(|v| shim_send(&sock, &me, &v));
+            let _ = net::send(
+                &to_shim,
+                &reply.unwrap_or_else(|e| {
+                    obj(vec![("type", s("error")), ("error", s(&e.to_string()))])
+                }),
+            );
+        }
+        // The shim's stdin closed: its harness is gone, so this session is too.
+        std::process::exit(0);
+    });
+    serve(socket, id, store_path, None, Some(out))
+}
+
+fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
+    if net::field(v, "type")? != "send" {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected send"));
+    }
+    let mail = match net::field(v, "mail") {
+        Ok(m) => m.to_string(),
+        Err(_) => gen_uuid()?,
+    };
+    let mail = send_mail(
+        socket,
+        from,
+        net::field(v, "to")?,
+        &mail,
+        net::field(v, "body")?,
+    )?;
+    Ok(obj(vec![("type", s("accepted")), ("mail", s(&mail))]))
+}
+
+fn serve(
+    socket: PathBuf,
+    id: String,
+    store_path: PathBuf,
+    hold_before_ack: Option<PathBuf>,
+    shim: Option<net::Writer>,
 ) -> io::Result<()> {
     let (mut store, prior) = DurLog::open(&store_path)?;
     let mut records: HashMap<String, String> = HashMap::new(); // mail -> record
@@ -34,8 +87,13 @@ pub fn run(
         &writer,
         &obj(vec![("type", s("register")), ("session", s(&id))]),
     )?;
-    println!("READY session={id}");
-    io::stdout().flush()?;
+    match &shim {
+        Some(w) => net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?,
+        None => {
+            println!("READY session={id}");
+            io::stdout().flush()?;
+        }
+    }
 
     let mut req = 0i64;
     for line in lines {
@@ -56,11 +114,25 @@ pub fn run(
                         ]);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
-                        println!("STORED mail={mail} record={record}");
-                        io::stdout().flush()?;
+                        if shim.is_none() {
+                            println!("STORED mail={mail} record={record}");
+                            io::stdout().flush()?;
+                        }
                         record
                     }
                 };
+                if let Some(w) = &shim {
+                    net::send(
+                        w,
+                        &obj(vec![
+                            ("type", s("mail")),
+                            ("mail", s(&mail)),
+                            ("from", s(net::field(&v, "from")?)),
+                            ("body", s(net::field(&v, "body")?)),
+                            ("record", s(&record)),
+                        ]),
+                    )?;
+                }
                 if let Some(marker) = &hold_before_ack {
                     if !marker.exists() {
                         std::fs::write(marker, "held\n")?;
@@ -82,7 +154,7 @@ pub fn run(
                     ]),
                 )?;
             }
-            "acked" => {
+            "acked" if shim.is_none() => {
                 println!(
                     "DELIVERED mail={} record={}",
                     net::field(&v, "mail")?,
@@ -96,6 +168,7 @@ pub fn run(
     Ok(())
 }
 
+/// The client: one send, reporting acceptance on stdout.
 pub fn send(
     socket: PathBuf,
     from: String,
@@ -103,7 +176,13 @@ pub fn send(
     mail: String,
     body: String,
 ) -> io::Result<()> {
-    let conn = UnixStream::connect(&socket)?;
+    let mail = send_mail(&socket, &from, &to, &mail, &body)?;
+    println!("ACCEPTED mail={mail}");
+    Ok(())
+}
+
+fn send_mail(socket: &PathBuf, from: &str, to: &str, mail: &str, body: &str) -> io::Result<String> {
+    let conn = UnixStream::connect(socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     let mut lines = net::lines(Box::new(conn));
     net::send(
@@ -111,17 +190,16 @@ pub fn send(
         &obj(vec![
             ("type", s("send")),
             ("req", Value::Int(1)),
-            ("mail", s(&mail)),
-            ("from", s(&from)),
-            ("to", s(&to)),
-            ("body", s(&body)),
+            ("mail", s(mail)),
+            ("from", s(from)),
+            ("to", s(to)),
+            ("body", s(body)),
         ]),
     )?;
     for line in &mut lines {
         let v = line?;
         if net::field(&v, "type")? == "accepted" {
-            println!("ACCEPTED mail={}", net::field(&v, "mail")?);
-            return Ok(());
+            return Ok(net::field(&v, "mail")?.to_string());
         }
     }
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))

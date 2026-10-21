@@ -3,8 +3,9 @@
 
 use std::fs;
 use std::io::Read;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const BIN: &str = env!("CARGO_BIN_EXE_roger");
@@ -51,6 +52,33 @@ impl Rig {
             .unwrap();
         self.children.push(child);
         self.children.len() - 1
+    }
+
+    /// Start `roger adapter` on a host's daemon socket. Returns its stdin, the
+    /// only way a shim speaks to it; its stdout is the file `out`.
+    fn start_adapter(&mut self, sock: &str, id: &str, store: &str, out: &str) -> ChildStdin {
+        let child_out = fs::File::create(self.p(out)).unwrap();
+        let mut child = Command::new(BIN)
+            .args([
+                "adapter",
+                "--socket",
+                self.p(sock).to_str().unwrap(),
+                "--id",
+                id,
+                "--store",
+                self.p(store).to_str().unwrap(),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::from(child_out))
+            .stderr(Stdio::from(
+                fs::File::create(self.p(&format!("{out}.err"))).unwrap(),
+            ))
+            .spawn()
+            .unwrap();
+        let stdin = child.stdin.take().unwrap();
+        self.children.push(child);
+        wait_for_text(&self.p(out), "\"type\":\"ready\"", Duration::from_secs(10));
+        stdin
     }
 
     /// The coordinator argv, shared by the first start and every restart so a
@@ -533,4 +561,72 @@ fn directed_mail_round_trips_once_in_order() {
         1,
         "{coord}"
     );
+}
+
+#[test]
+fn adapter_session_and_tracer_exchange_mail_both_ways() {
+    let mut rig = Rig::new("adapter");
+    rig.start_stack();
+    rig.start_recipient("tracer.out", false);
+    let adapter_id = SENDER;
+    let mut shim_in = rig.start_adapter("a.sock", adapter_id, "adapter.store", "adapter.out");
+
+    // Shim -> Tracer: the shim forwards a send tool call as one line.
+    let body_out = "from the shim [[153:Meteor Shower:7]]";
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"s-1\",\"body\":\"{body_out}\"}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("adapter.out"),
+        "\"type\":\"accepted\",\"mail\":\"s-1\"",
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("tracer.out"),
+        "DELIVERED mail=s-1",
+        Duration::from_secs(10),
+    );
+    let tracer_store = read(&rig.p("recipient.store"));
+    assert_eq!(
+        count_lines_with(&tracer_store, body_out),
+        1,
+        "{tracer_store}"
+    );
+
+    // Tracer's host -> adapter: the shim is told the body, but only after
+    // the adapter's own Store holds it, and the receipt names that record.
+    let body_in = "to the shim [[0:FLEET:0]]";
+    let sent = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            rig.p("b.sock").to_str().unwrap(),
+            "--from",
+            RECIPIENT,
+            "--to",
+            adapter_id,
+            "--mail",
+            "s-2",
+            "--body",
+            body_in,
+        ])
+        .output()
+        .unwrap();
+    assert!(sent.status.success());
+    wait_for_text(
+        &rig.p("adapter.out"),
+        &format!("\"type\":\"mail\",\"mail\":\"s-2\",\"from\":\"{RECIPIENT}\",\"body\":\"{body_in}\",\"record\":\"r-1\""),
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("adapter.store"));
+    assert_eq!(count_lines_with(&store, body_in), 1, "{store}");
+    wait_for_text(
+        &rig.p("coord.log"),
+        "\"ev\":\"receipt\",\"mail\":\"s-2\"",
+        Duration::from_secs(10),
+    );
+    let coord = read(&rig.p("coord.log"));
+    assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
 }

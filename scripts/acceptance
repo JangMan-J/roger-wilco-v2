@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance cross-host
+# Usage: scripts/acceptance <cross-host|independence>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -14,6 +14,20 @@ coord_pid=""
 daemon_pid=""
 work=""
 remote_work=""
+pids=()
+
+cleanup() {
+  local p
+  for p in "$coord_pid" "$daemon_pid" "${pids[@]}"; do
+    [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
+  done
+  if [[ -n "$remote_work" ]]; then
+    ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" \
+      "bash -lc 'for f in ${remote_work}/*.pid; do [ -f \"\$f\" ] && kill \"\$(cat \"\$f\")\" 2>/dev/null; done; sleep 0.3; rm -rf $remote_work; exit 0'" \
+      >/dev/null 2>&1 || true
+  fi
+  [[ -n "$work" ]] && rm -rf "$work" || true
+}
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
@@ -48,14 +62,6 @@ cross_host() {
   remote_work="/tmp/roger-accept.$$"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
 
-  cleanup() {
-    [[ -n "$coord_pid" ]] && kill "$coord_pid" 2>/dev/null || true
-    [[ -n "$daemon_pid" ]] && kill "$daemon_pid" 2>/dev/null || true
-    ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" \
-      "bash -lc 'for f in ${remote_work}/*.pid; do [ -f \"\$f\" ] && kill \"\$(cat \"\$f\")\" 2>/dev/null; done; sleep 0.3; rm -rf $remote_work; exit 0'" \
-      >/dev/null 2>&1 || true
-    [[ -n "$work" ]] && rm -rf "$work" || true
-  }
   trap cleanup EXIT
 
   "$bin" coordinator --bind "$ts_ip:0" --port-file "$work/port" \
@@ -124,7 +130,84 @@ cross_host() {
   echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1"
 }
 
+# Proof 2. One coordinator, two host daemons, one client binary: a Pi session
+# (shim + adapter) on host-a and a Tracer (no harness) on host-b exchange Mail
+# in both directions. Loopback only; Pi runs in RPC mode and needs no model,
+# since a command and a delivery both skip the model.
+independence() {
+  command -v pi >/dev/null || fail "pi CLI required for the Pi session"
+  (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
+  local bin="$ROOT/target/release/roger"
+  local token pi_addr="$SENDER" tracer_addr="$RECIPIENT"
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  trap cleanup EXIT
+
+  "$bin" coordinator --bind 127.0.0.1:0 --port-file "$work/port" \
+    --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "coordinator port file" test -s "$work/port"
+  local coord="127.0.0.1:$(cat "$work/port")" h
+  for h in a b; do
+    "$bin" daemon --coordinator "$coord" --token "$token" --host-id "host-$h" \
+      --socket "$work/$h.sock" --data "$work/$h.log" >"$work/daemon-$h.out" 2>&1 &
+    pids+=("$!")
+    wait_for 10 "daemon $h socket" test -S "$work/$h.sock"
+  done
+
+  "$bin" session --socket "$work/b.sock" --id "$tracer_addr" --store "$work/tracer.store" \
+    >"$work/tracer.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+
+  # The fifo is held open read-write so Pi's stdin stays open until cleanup.
+  mkfifo "$work/pi.in"
+  exec 3<>"$work/pi.in"
+  PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$bin" ROGER_SOCKET="$work/a.sock" \
+    ROGER_SESSION="$pi_addr" ROGER_STORE="$work/pi.store" \
+    pi --mode rpc --no-session --offline --no-extensions --no-skills --no-context-files \
+      --no-mcp -e "$ROOT/shims/pi/roger.ts" <&3 >"$work/pi.out" 2>"$work/pi.err" &
+  pids+=("$!")
+  wait_for 30 "pi accepts commands" pi_ready
+
+  local out_body="pi to tracer [[153:Meteor Shower:7]]"
+  local in_body="tracer to pi [[0:FLEET:0]]"
+
+  # Pi -> Tracer: a slash command the shim handles; no model runs.
+  printf '{"id":"send1","type":"prompt","message":"/roger-send %s %s"}\n' "$tracer_addr" "$out_body" >&3
+  wait_for 15 "tracer DELIVERED Pi's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
+  [[ "$(grep -cF "$out_body" "$work/tracer.store")" == 1 ]] || fail "tracer Store must hold Pi's body exactly once"
+
+  # Tracer -> Pi: the client, from the tracer's host, addressed to the Pi session.
+  "$bin" send --socket "$work/b.sock" --from "$tracer_addr" --to "$pi_addr" \
+    --mail indep-2 --body "$in_body" | grep -q "ACCEPTED mail=indep-2" || fail "send to Pi not accepted"
+  wait_for 15 "Pi Store holds the tracer's body" grep -qF "$in_body" "$work/pi.store"
+  [[ "$(grep -cF "$in_body" "$work/pi.store")" == 1 ]] || fail "Pi Store must hold the tracer's body exactly once"
+  wait_for 15 "Pi transcript shows the mail" pi_transcript_has "$in_body"
+  grep -q '"type":"agent_start"' "$work/pi.out" && fail "delivery started a turn"
+
+  [[ "$(grep -c '"ev":"mail"' "$work/coord.log")" == 2 ]] || fail "coordinator must hold exactly two mail rows"
+  [[ "$(grep -c '"ev":"receipt"' "$work/coord.log")" == 2 ]] || fail "coordinator must hold exactly two receipts"
+  [[ "$(grep -c '"record":"r-1"' "$work/coord.log")" == 2 ]] || fail "each receipt must name the recipient's record r-1"
+
+  "$ROOT/scripts/check-harness-free" || fail "core names a harness"
+  echo "PASS independence: Pi session and Tracer exchanged Mail both ways through one coordinator, two host daemons, one client and one adapter binary; each Store holds its body once; no turn started"
+}
+
+pi_ready() { # Pi answers get_state once its runtime is up
+  printf '{"id":"ready%s","type":"get_state"}\n' "$RANDOM" >&3
+  sleep 0.3
+  grep -q '"command":"get_state","success":true' "$work/pi.out"
+}
+
+pi_transcript_has() {
+  printf '{"id":"msgs%s","type":"get_messages"}\n' "$RANDOM" >&3
+  sleep 0.3
+  grep '"command":"get_messages"' "$work/pi.out" | grep -qF "$1"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
-  *) echo "usage: $0 cross-host" >&2; exit 2 ;;
+  independence) independence ;;
+  *) echo "usage: $0 <cross-host|independence>" >&2; exit 2 ;;
 esac
