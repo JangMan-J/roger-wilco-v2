@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims|references|broadcast>
+# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims|references|broadcast|wake>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -183,19 +183,21 @@ start_tracer() { # the Tracer: a session with no harness, on host-b
 }
 
 # Pi in RPC mode on host-a, driven through fd 3. pi_start <tag> <address>
-# <roger-binary> <extension>; output lands in $work/<tag>.out. A stub
-# <roger-binary> stands in for the adapter only in the pi-shim failure cases.
+# <roger-binary> <extension> [pi-args...]; output lands in $work/<tag>.out. A
+# stub <roger-binary> stands in for the adapter only in the pi-shim failure
+# cases. ROGER_WAKE_LATENCY_MS, when set by the caller, reaches the shim.
 pi_out=""
 pi_pid=""
 pi_start() {
   local tag="$1" addr="$2" rbin="$3" ext="$4"
+  shift 4
   pi_out="$work/$tag.out"
   mkfifo "$work/$tag.in"
   exec 3<>"$work/$tag.in" # read-write: Pi's stdin stays open until pi_stop
   PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$rbin" ROGER_SOCKET="$work/a.sock" \
     ROGER_SESSION="$addr" ROGER_STORE="$work/$tag.store" \
     pi --mode rpc --no-session --offline --no-extensions --no-skills --no-context-files \
-      --no-mcp -e "$ext" <&3 >"$pi_out" 2>"$work/$tag.err" &
+      --no-mcp -e "$ext" "$@" <&3 >"$pi_out" 2>"$work/$tag.err" &
   pi_pid=$!
   pids+=("$pi_pid")
   wait_for 30 "pi accepts commands" pi_call get_state '{"type":"get_state"}'
@@ -250,7 +252,9 @@ independence() {
   local pi_addr="$SENDER" tracer_addr="$RECIPIENT" claude_addr="$CLAUDE"
   loopback_stack
   start_tracer
-  pi_start pi "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts"
+  # No model runs in this check, so the Pi session declares no wake: its
+  # deliveries render without starting a turn. Proof 5 (`wake`) covers wake.
+  ROGER_WAKE_LATENCY_MS=off pi_start pi "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts"
 
   local out_body="pi to tracer [[153:Meteor Shower:7]]"
   local in_body="tracer to pi [[0:FLEET:0]]"
@@ -611,6 +615,101 @@ broadcast() {
   echo "PASS broadcast: one broadcast reached all three registered sessions on decent-spider and agent-jail, including an idle one and one SIGKILLed between Store and Ack, exactly once each, every copy without a wake request"
 }
 
+# Proof 5. A Pi session (real Pi runtime and shim, scripted faux model, no
+# network) on host-a declares its wake latency on the Board; the Tracer on
+# host-b sends it directed Mail. Idle: the Mail starts a turn within the
+# declared latency, measured from before the send to the first observation of
+# agent_start. Busy: the same kind of Mail is stored and acked at once (the
+# core's Deliver does not wait), the shim queues it as a follow-up, and Pi
+# hands it to the model only after the busy turn's reply. Then a Broadcast,
+# which carries no wake request, reaches the same idle session and starts no
+# turn. Loopback only.
+pi_events() { # pi_events <event-type> <fixed-string>: count of such event lines
+  grep "^{\"type\":\"$1\"" "$pi_out" | grep -cF -- "$2" || true
+}
+pi_events_at_least() { [[ "$(pi_events "$1" "")" -ge "$2" ]]; } # re-read on every wait_for try
+first_line() { # first_line <event-type> <fixed-string>: line number in $pi_out
+  grep -n "^{\"type\":\"$1\"" "$pi_out" | grep -F -- "$2" | head -n1 | cut -d: -f1
+}
+
+wake() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  local pi_addr="$SENDER" declared t0 t1 n
+  loopback_stack
+  start_tracer
+  ROGER_WAKE_LATENCY_MS=1500 pi_start wake "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts" \
+    -e "$ROOT/shims/pi/test/faux-model.ts" --model faux/faux-1
+
+  # The sender reads the recipient's declaration from the Board on its own host.
+  local row="DECLARED address=$pi_addr declared=wake-latency-ms="
+  wait_for 15 "Pi's declaration on the Board" bash -c "'$bin' board --socket '$work/b.sock' | grep -qF '$row'"
+  declared="$("$bin" board --socket "$work/b.sock" | grep -F "$row" | sed 's/.*declared=wake-latency-ms=//')"
+  [[ "$declared" =~ ^[0-9]+$ ]] || fail "declared wake latency is not a number: '$declared'"
+  [[ "$(pi_events agent_start "")" == 0 ]] || fail "a turn started before any Mail"
+
+  # Idle: the Mail starts a turn within the declared latency.
+  local idle_body="wake while idle [[153:Meteor Shower:7]]"
+  t0="$(now_ms)"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-1 --body "$idle_body" | grep -q "ACCEPTED mail=wake-1" || fail "idle send not accepted"
+  until [[ "$(pi_events agent_start "")" -ge 1 ]]; do
+    (( $(now_ms) - t0 <= declared )) || fail "no turn within the declared ${declared} ms of the idle send"
+    sleep 0.01
+  done
+  t1="$(now_ms)"
+  (( t1 - t0 <= declared )) || fail "turn started $(( t1 - t0 )) ms after the idle send, over the declared ${declared} ms"
+  wait_for 15 "idle wake turn ends" pi_events_at_least agent_end 1
+  [[ "$(pi_events message_end "saw: Mail wake-1 from $RECIPIENT")" == 1 ]] \
+    || fail "the wake turn's model was not given the idle Mail"
+
+  # Busy: a turn holds the model; the Mail is Delivered and acked now, and
+  # reaches the model only at the turn boundary.
+  pi_call busy '{"type":"prompt","message":"busy 4000"}' || fail "busy prompt unanswered"
+  wait_for 10 "busy turn starts" pi_events_at_least agent_start 2
+  local busy_body="wake while busy [[0:FLEET:0]]"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-2 --body "$busy_body" | grep -q "ACCEPTED mail=wake-2" || fail "busy send not accepted"
+  wait_for 10 "busy session's Store holds the Mail" grep -qF "$busy_body" "$work/wake.store"
+  wait_for 10 "receipt while busy" log_count '"ev":"receipt"' 2 "$work/coord.log"
+  [[ "$(pi_events agent_end "")" == 1 ]] || fail "the busy turn ended before the Mail was stored; nothing was proven busy"
+  [[ "$(pi_events message_start '"mail":"wake-2"')" == 0 ]] \
+    || fail "the Mail entered the transcript mid-turn instead of queueing"
+  wait_for 15 "busy turn and its follow-up end" pi_events_at_least agent_end 2
+  local done_at mail_at saw_at
+  done_at="$(first_line message_end '"text":"busy done"')"
+  mail_at="$(first_line message_start '"mail":"wake-2"')"
+  saw_at="$(first_line message_end "saw: Mail wake-2 from $RECIPIENT")"
+  [[ -n "$done_at" && -n "$mail_at" && -n "$saw_at" ]] \
+    || fail "missing busy reply ($done_at), queued Mail ($mail_at), or follow-up reply ($saw_at)"
+  (( done_at < mail_at && mail_at < saw_at )) \
+    || fail "Mail not handed over at the turn boundary: busy reply line $done_at, Mail line $mail_at, follow-up line $saw_at"
+
+  # A Broadcast to the now idle session: shown, stored, acked, no turn.
+  local bcast_body="broadcast to an idle Pi [[0:FLEET:0]]" starts
+  starts="$(pi_events agent_start "")"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to '*' \
+    --mail bcast-1 --body "$bcast_body" | grep -q "ACCEPTED mail=bcast-1" || fail "broadcast not accepted"
+  wait_for 10 "Pi Store holds the broadcast" grep -qF "$bcast_body" "$work/wake.store"
+  wait_for 10 "Pi transcript shows the broadcast" pi_transcript_has "$bcast_body"
+  wait_for 10 "broadcast receipts" log_count '"ev":"receipt"' 4 "$work/coord.log"
+  [[ "$(pi_events agent_start "")" == "$starts" ]] || fail "a broadcast started a turn"
+
+  # Exactly once, end to end.
+  for n in 1 2; do
+    [[ "$(pi_events message_end "\"mail\":\"wake-$n\"")" == 1 ]] || fail "Pi transcript must show wake-$n once"
+  done
+  log_count "$idle_body" 1 "$work/wake.store" || fail "Store must hold the idle body once"
+  log_count "$busy_body" 1 "$work/wake.store" || fail "Store must hold the busy body once"
+  log_count '"ev":"mail"' 2 "$work/coord.log" || fail "coordinator must hold exactly two mail rows"
+  log_count "$bcast_body" 1 "$work/wake.store" || fail "Store must hold the broadcast once"
+  log_count '"ev":"receipt"' 4 "$work/coord.log" || fail "coordinator must hold two directed and two broadcast receipts"
+  pi_stop
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS wake: idle Pi session started a turn $(( t1 - t0 )) ms after directed Mail (declared ${declared} ms on the Board); busy session stored and acked the same Mail at once and handed it to the model at the turn boundary; a broadcast to the idle session started no turn; each Mail stored, acked, and shown once"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
   independence) independence ;;
@@ -618,5 +717,6 @@ case "${1:-}" in
   claims) claims ;;
   references) references ;;
   broadcast) broadcast ;;
-  *) echo "usage: $0 <cross-host|independence|pi-shim|claims|references|broadcast>" >&2; exit 2 ;;
+  wake) wake ;;
+  *) echo "usage: $0 <cross-host|independence|pi-shim|claims|references|broadcast|wake>" >&2; exit 2 ;;
 esac

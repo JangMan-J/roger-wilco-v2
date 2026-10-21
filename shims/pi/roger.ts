@@ -1,11 +1,19 @@
 // Pi shim: the one place that knows Pi runs this session. It starts the
 // harness-free `roger adapter`, renders each delivered Mail into the
-// transcript without starting a turn, and forwards send calls as lines.
-// It never acknowledges a delivery: the adapter acks from its own Store.
+// transcript, and forwards send calls as lines. It never acknowledges a
+// delivery: the adapter acks from its own Store.
+//
+// Wake: a delivered Mail that carries a wake request (every directed Mail;
+// a Broadcast sets `wake: false`) starts a turn when Pi is idle, and when Pi
+// is busy it is queued as a follow-up that Pi hands the model at the turn
+// boundary. Pi decides idle or busy; the core never learns either. The shim
+// declares its wake latency to the Board as `wake-latency-ms=<n>`.
 //
 // Env: ROGER_SOCKET (host daemon socket) and ROGER_STORE (Store path) are
 // required; ROGER_SESSION is the Address (adapter generates one if unset);
-// ROGER_BIN is the adapter binary (default `roger` on PATH).
+// ROGER_BIN is the adapter binary (default `roger` on PATH);
+// ROGER_WAKE_LATENCY_MS is the declared wake latency (default 1000), or `off`
+// to render Mail without ever starting a turn and declare nothing.
 import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { Type } from "@earendil-works/pi-ai";
@@ -13,7 +21,17 @@ import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 type Pending = { ok: (mail: string) => void; fail: (e: Error) => void };
 
+/** The declared wake latency in ms, or undefined when wake is off. */
+export function wakeLatency(env: string | undefined): number | undefined {
+	if (env === "off") return undefined;
+	if (env === undefined || env === "") return 1000;
+	const n = Number(env);
+	if (!Number.isInteger(n) || n <= 0) throw new Error(`ROGER_WAKE_LATENCY_MS must be a positive integer or off, saw ${env}`);
+	return n;
+}
+
 export default function (pi: ExtensionAPI) {
+	const wakeMs = wakeLatency(process.env.ROGER_WAKE_LATENCY_MS);
 	let adapter: ChildProcess | undefined;
 	let why = "roger adapter is not running"; // why the last adapter is gone
 	const seen = new Set<string>(); // a redelivery after a crash shares its record id
@@ -32,6 +50,7 @@ export default function (pi: ExtensionAPI) {
 		if (!socket || !store) throw new Error("ROGER_SOCKET and ROGER_STORE are required");
 		const args = ["adapter", "--socket", socket, "--store", store];
 		if (process.env.ROGER_SESSION) args.push("--id", process.env.ROGER_SESSION);
+		if (wakeMs !== undefined) args.push("--declare", `wake-latency-ms=${wakeMs}`);
 		const child = spawn(process.env.ROGER_BIN ?? "roger", args, { stdio: ["pipe", "pipe", "inherit"] });
 		adapter = child;
 		// 'error' (spawn failure) and 'exit' both end this adapter; an unhandled
@@ -57,6 +76,9 @@ export default function (pi: ExtensionAPI) {
 			else if (ev.type === "error") pending.shift()?.fail(new Error(ev.error));
 			else if (ev.type === "mail" && !seen.has(ev.record)) {
 				seen.add(ev.record);
+				const wake = wakeMs !== undefined && ev.wake !== false;
+				// Idle: triggerTurn starts a turn now. Busy: followUp waits for the
+				// current turn to end, then Pi continues with this Mail.
 				pi.sendMessage(
 					{
 						customType: "roger-mail",
@@ -64,7 +86,7 @@ export default function (pi: ExtensionAPI) {
 						display: true,
 						details: { mail: ev.mail, from: ev.from, record: ev.record },
 					},
-					{ triggerTurn: false },
+					wake ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
 				);
 			}
 		});

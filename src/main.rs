@@ -44,6 +44,7 @@ fn main() -> io::Result<()> {
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--hold-before-ack").map(PathBuf::from),
+            arg(&args, "--declare"),
         ),
         "adapter" => session::adapter(
             PathBuf::from(need(&args, "--socket")?),
@@ -54,6 +55,7 @@ fn main() -> io::Result<()> {
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--hold-before-ack").map(PathBuf::from),
+            arg(&args, "--declare"),
         ),
         "send" => session::send(
             PathBuf::from(need(&args, "--socket")?),

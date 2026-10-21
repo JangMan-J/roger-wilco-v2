@@ -1226,3 +1226,50 @@ fn a_directed_mail_id_can_never_equal_a_broadcast_copy_id() {
     let coord = read(&rig.p("coord.log"));
     assert!(!coord.contains("impostor"), "{coord}");
 }
+
+/// A session's declared text is opaque: the Board returns it byte-identical
+/// from both hosts, and a restarted coordinator replays it from its log.
+#[test]
+fn declared_text_reaches_the_board_verbatim_and_survives_a_coordinator_restart() {
+    let mut rig = Rig::new("declared");
+    rig.start_stack();
+    let declared = "wake-latency-ms=1500 [[153:Meteor Shower:7]]";
+    let sock = rig.p("b.sock").to_str().unwrap().to_string();
+    let store = rig.p("recipient.store").to_str().unwrap().to_string();
+    rig.spawn(
+        &[
+            "session",
+            "--socket",
+            &sock,
+            "--id",
+            RECIPIENT,
+            "--store",
+            &store,
+            "--declare",
+            declared,
+        ],
+        "recipient.out",
+    );
+    wait_for_text(&rig.p("recipient.out"), "READY", Duration::from_secs(10));
+    let want = format!("DECLARED address={RECIPIENT} declared={declared}\n");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !board(&rig, "a.sock").contains(&want) {
+        assert!(Instant::now() < deadline, "{}", board(&rig, "a.sock"));
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(board(&rig, "b.sock").contains(&want));
+
+    rig.restart_coordinator();
+    wait_until_board_reaches_both(&rig);
+    for s in ["a.sock", "b.sock"] {
+        let b = board(&rig, s);
+        assert!(b.contains(&want), "{s}: {b}");
+    }
+    let coord = read(&rig.p("coord.log"));
+    // The daemon's re-Register repeats the same text, which logs nothing new.
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"declared\""),
+        1,
+        "{coord}"
+    );
+}

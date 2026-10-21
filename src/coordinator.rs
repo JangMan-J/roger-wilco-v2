@@ -37,6 +37,8 @@ struct State {
     log: DurLog,
     sessions: HashMap<String, String>, // session -> host
     labels: HashMap<String, String>,   // session -> label, stored verbatim
+    /// Opaque text each session declared at its latest Register, verbatim.
+    declared: HashMap<String, String>,
     mails: HashMap<String, Mail>,
     order: Vec<String>,
     /// Broadcast ids already committed, so a resent broadcast fans out once.
@@ -61,6 +63,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         log,
         sessions: HashMap::new(),
         labels: HashMap::new(),
+        declared: HashMap::new(),
         mails: HashMap::new(),
         order: Vec::new(),
         broadcasts: HashSet::new(),
@@ -99,6 +102,14 @@ fn apply(state: &mut State, v: &Value) {
         Some("session") => {
             if let (Ok(session), Ok(host)) = (net::field(v, "session"), net::field(v, "host")) {
                 state.sessions.insert(session.to_string(), host.to_string());
+            }
+        }
+        Some("declared") => {
+            if let Ok(session) = net::field(v, "session") {
+                match net::declared_of(v) {
+                    Some(d) => state.declared.insert(session.to_string(), d),
+                    None => state.declared.remove(session),
+                };
             }
         }
         Some("label") => {
@@ -247,6 +258,16 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     }
                     if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
                         set_label(&mut st, &session, label)?;
+                    }
+                    let declared = net::declared_of(&v);
+                    if st.declared.get(&session) != declared.as_ref() {
+                        let mut ev = vec![("ev", s("declared")), ("session", s(&session))];
+                        if let Some(d) = &declared {
+                            ev.push(("declared", s(d)));
+                        }
+                        let ev = obj(ev);
+                        st.log.append(&json::stringify(&ev))?;
+                        apply(&mut st, &ev);
                     }
                     pending_pushes(&st, &host, Some(&session))
                 };
@@ -503,14 +524,18 @@ fn board(st: &State, v: &Value) -> Value {
     let sessions = sessions
         .into_iter()
         .map(|(session, host)| {
-            obj(vec![
+            let mut pairs = vec![
                 ("session", s(session)),
                 ("host", s(host)),
                 (
                     "label",
                     s(st.labels.get(session).map(String::as_str).unwrap_or("")),
                 ),
-            ])
+            ];
+            if let Some(d) = st.declared.get(session) {
+                pairs.push(("declared", s(d)));
+            }
+            obj(pairs)
         })
         .collect();
     let claims = st

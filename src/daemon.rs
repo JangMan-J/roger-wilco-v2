@@ -45,6 +45,9 @@ struct State {
     /// arrives upstream would leave the mail pending forever.
     receipts: Vec<Receipt>,
     sessions: HashMap<String, Writer>,
+    /// Each local session's declared text, repeated on every Register
+    /// upstream: a Register without it clears the declaration.
+    declared: HashMap<String, String>,
     upstream: Option<Writer>,
     next_req: i64,
     waiters: HashMap<i64, mpsc::Sender<Value>>,
@@ -70,6 +73,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         acked: HashSet::new(),
         receipts: Vec::new(),
         sessions: HashMap::new(),
+        declared: HashMap::new(),
         upstream: None,
         next_req: 1,
         waiters: HashMap::new(),
@@ -192,7 +196,7 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         let known = st
             .sessions
             .keys()
-            .map(|id| register_msg(id, None))
+            .map(|id| register_msg(id, None, st.declared.get(id).map(String::as_str)))
             .collect();
         (known, st.receipts.clone())
     };
@@ -255,10 +259,13 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
     Ok(())
 }
 
-fn register_msg(session: &str, label: Option<&str>) -> Value {
+fn register_msg(session: &str, label: Option<&str>, declared: Option<&str>) -> Value {
     let mut pairs = vec![("type", s("register")), ("session", s(session))];
     if let Some(label) = label {
         pairs.push(("label", s(label)));
+    }
+    if let Some(d) = declared {
+        pairs.push(("declared", s(d)));
     }
     obj(pairs)
 }
@@ -353,6 +360,7 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     if let Some(id) = session_id {
         let mut st = state.lock().unwrap();
         st.sessions.remove(&id);
+        st.declared.remove(&id);
     }
     result
 }
@@ -370,9 +378,14 @@ fn local_loop(
                 let session = net::field(&v, "session")?.to_string();
                 let label = v.get("label").and_then(|x| x.as_str()).map(str::to_string);
                 *session_id = Some(session.clone());
+                let declared = net::declared_of(&v);
                 let (upstream, pending) = {
                     let mut st = state.lock().unwrap();
                     st.sessions.insert(session.clone(), Arc::clone(writer));
+                    match &declared {
+                        Some(d) => st.declared.insert(session.clone(), d.clone()),
+                        None => st.declared.remove(&session),
+                    };
                     let pending: Vec<Value> = st
                         .order
                         .iter()
@@ -390,7 +403,10 @@ fn local_loop(
                     (st.upstream.clone(), pending)
                 };
                 if let Some(up) = upstream {
-                    let _ = net::send(&up, &register_msg(&session, label.as_deref()));
+                    let _ = net::send(
+                        &up,
+                        &register_msg(&session, label.as_deref(), declared.as_deref()),
+                    );
                 }
                 for p in pending {
                     let _ = net::send(writer, &p);

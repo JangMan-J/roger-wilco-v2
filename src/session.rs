@@ -17,8 +17,17 @@ pub fn run(
     label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
+    declared: Option<String>,
 ) -> io::Result<()> {
-    serve(socket, id, label, store_path, hold_before_ack, None)
+    serve(
+        socket,
+        id,
+        label,
+        store_path,
+        hold_before_ack,
+        declared,
+        None,
+    )
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
@@ -26,12 +35,14 @@ pub fn run(
 /// (optional `"mail"`) and is told `ready`, `accepted`, `error`, and `mail`.
 /// A `mail` line follows the Store write and never gates the ack: the shim
 /// renders what the adapter already holds and acknowledges nothing.
+/// `declared` is the shim's opaque self-description, sent with Register.
 pub fn adapter(
     socket: PathBuf,
     id: String,
     label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
+    declared: Option<String>,
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
     let (sock, me, to_shim) = (socket.clone(), id.clone(), out.clone());
@@ -60,7 +71,15 @@ pub fn adapter(
         // The shim's stdin closed: its harness is gone, so this session is too.
         std::process::exit(0);
     });
-    serve(socket, id, label, store_path, hold_before_ack, Some(out))
+    serve(
+        socket,
+        id,
+        label,
+        store_path,
+        hold_before_ack,
+        declared,
+        Some(out),
+    )
 }
 
 fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
@@ -92,6 +111,7 @@ fn serve(
     label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
+    declared: Option<String>,
     shim: Option<net::Writer>,
 ) -> io::Result<()> {
     let (mut store, prior) = DurLog::open(&store_path)?;
@@ -111,6 +131,9 @@ fn serve(
     let mut register = vec![("type", s("register")), ("session", s(&id))];
     if let Some(label) = &label {
         register.push(("label", s(label)));
+    }
+    if let Some(d) = &declared {
+        register.push(("declared", s(d)));
     }
     net::send(&writer, &obj(register))?;
     match &shim {
@@ -342,6 +365,13 @@ pub fn board(socket: PathBuf) -> io::Result<()> {
             net::field(v, "host")?,
             net::field(v, "label")?
         );
+        // Its own line: label and declared text are both free to the end.
+        if let Ok(d) = net::field(v, "declared") {
+            println!(
+                "DECLARED address={} declared={d}",
+                net::field(v, "session")?
+            );
+        }
     }
     for v in &claims {
         println!("CLAIM {}key={}", holder_text(v), net::field(v, "key")?);
