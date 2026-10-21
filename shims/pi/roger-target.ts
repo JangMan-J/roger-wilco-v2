@@ -90,3 +90,41 @@ export function resolve(rows: Row[], input: string): Target | string {
 	const used = fits.length ? fits[0]!.label.length : first.length;
 	return { to: row.session, row, rest: restAfter(used) };
 }
+
+const KEYWORDS = ["all", "help", "label", "relabel"];
+
+/**
+ * How to type a session's label as a target: as-is when that resolves to it,
+ * else quoted as `@"<label>"` (a keyword, a label another label extends, or a
+ * label shared or Address-shaped). Address-shaped labels never route at all.
+ */
+function labelTarget(rows: Row[], r: Row): string | undefined {
+	if (!r.label || isAddress(r.label) || r.label.includes('"')) return undefined;
+	const t = resolve(rows, r.label);
+	if (typeof t === "object" && t.row?.session === r.session && !KEYWORDS.includes(fold(r.label))) return r.label;
+	const q = resolve(rows, `@"${r.label}"`);
+	return typeof q === "object" && q.row?.session === r.session ? `@"${r.label}"` : undefined;
+}
+
+/**
+ * Completions for the /roger argument typed so far. The whole prefix is
+ * matched, so a label with spaces completes; `relabel ` is followed by a
+ * target. Returns values that replace the whole argument.
+ */
+export function completions(rows: Row[], prefix: string): string[] {
+	const lead = prefix.startsWith("relabel ") ? "relabel " : "";
+	const typed = fold(prefix.slice(lead.length));
+	// [what the user may type, what to insert]; a quoted label also matches
+	// its bare text.
+	const targets: [string, string][] = rows.flatMap((r) => {
+		const out: [string, string][] = [[r.session, r.session]];
+		const t = labelTarget(rows, r);
+		if (t) out.push([t, t], [r.label, t]);
+		return out;
+	});
+	const words: [string, string][] = [...KEYWORDS, BROADCAST].map((k) => [k, k]);
+	const values = (lead ? targets : [...words, ...targets])
+		.filter(([key]) => fold(key).startsWith(typed))
+		.map(([, value]) => value);
+	return [...new Set(values)].map((v) => `${lead}${v} `);
+}

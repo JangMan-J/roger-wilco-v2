@@ -1,7 +1,7 @@
 // Unit tests for /roger target resolution and presence: node --test shims/pi/test/roger-target.test.ts
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { DEFAULT_WINDOW_MS, present, resolve, windowMs, type Row, type Target } from "../roger-target.ts";
+import { completions, DEFAULT_WINDOW_MS, present, resolve, windowMs, type Row, type Target } from "../roger-target.ts";
 
 const A = "aaaaaaaa-0000-4000-8000-00000000000a";
 const B = "bbbbbbbb-0000-4000-8000-00000000000b";
@@ -102,4 +102,21 @@ test("windowMs: non-negative integer ms, else the default", () => {
 	assert.equal(windowMs("-5"), DEFAULT_WINDOW_MS);
 	assert.equal(windowMs("abc"), DEFAULT_WINDOW_MS);
 	assert.equal(windowMs("1.5"), DEFAULT_WINDOW_MS);
+});
+
+test("completions: whole-prefix match, spaced labels, quoting, relabel", () => {
+	const rows = [row(A, "[[153:Meteor Shower:7]]"), row(B, "Bob"), row(C, "Bob Smith")];
+	assert.deepEqual(completions(rows, "[[153:Met"), ["[[153:Meteor Shower:7]] "]);
+	assert.deepEqual(completions(rows, "[[153:Meteor Sh"), ["[[153:Meteor Shower:7]] "]);
+	// "Bob Smith" is ambiguous beside "Bob" (both fit), so it completes quoted;
+	// "Bob" alone resolves as typed.
+	assert.deepEqual(completions(rows, "bo"), ["Bob ", '@"Bob Smith" ']);
+	assert.deepEqual(completions(rows, "bob s"), ['@"Bob Smith" ']);
+	assert.deepEqual(completions(rows, '@"bob s'), ['@"Bob Smith" ']);
+	assert.deepEqual(completions(rows, "relabel aaaa"), [`relabel ${A} `]);
+	assert.deepEqual(completions(rows, "rel"), ["relabel "]);
+	assert.deepEqual(completions([row(A, "all")], "@"), ['@"all" ']);
+	assert.deepEqual(completions(rows, "zz"), []);
+	// The message after a full target is not completed.
+	assert.deepEqual(completions(rows, "Bob Smith hi"), []);
 });

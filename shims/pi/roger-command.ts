@@ -11,7 +11,7 @@
 // `/roger all` and roger_board {all: true} skip the filter.
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { BROADCAST, present, resolve, windowMs, type Row } from "./roger-target.ts";
+import { BROADCAST, completions, present, resolve, windowMs, type Row } from "./roger-target.ts";
 
 type Reply = Record<string, unknown>;
 export type Core = {
@@ -66,7 +66,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 	const rowText = (r: Row) =>
 		`${r.session}${r.session === core.me() ? " (you)" : ""} — host ${r.host}${r.label ? ` — ${r.label}` : ""}`;
 	const claimText = (c: ClaimRow) =>
-		`${c.key} — ${c.holder ?? "?"}${c.remaining_ms !== undefined ? ` (${Math.ceil(c.remaining_ms / 1000)}s left)` : ""}`;
+		`${JSON.stringify(c.key)} — ${c.holder ?? "?"}${c.remaining_ms !== undefined ? ` (${Math.ceil(c.remaining_ms / 1000)}s left)` : ""}`;
 
 	const boardText = (full: Board, shown: Board, all: boolean) => {
 		const now = full.now;
@@ -98,21 +98,14 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 	pi.registerCommand("roger", {
 		description: "Show the Board, message a session or broadcast, or set a label: /roger help",
 		getArgumentCompletions: async (prefix: string) => {
-			const words = prefix.split(" ");
-			if (words.length > 2 || (words.length === 2 && words[0] !== "relabel")) return null;
-			const last = words[words.length - 1]!;
 			let rows: Row[] = [];
 			try {
 				rows = (await board()).sessions;
 			} catch {
 				// no adapter: complete keywords only
 			}
-			const targets = rows.flatMap((r) => [r.session, ...(r.label ? [r.label] : [])]).map((v) => v + " ");
-			const values =
-				words.length === 1 ? ["all", "help", "label ", "relabel ", BROADCAST + " ", ...targets] : targets;
-			const lead = words.length === 2 ? "relabel " : "";
-			const hits = [...new Set(values)].filter((v) => v.startsWith(last));
-			return hits.length ? hits.map((v) => ({ value: lead + v, label: v.trim() })) : null;
+			const hits = completions(rows, prefix);
+			return hits.length ? hits.map((v) => ({ value: v, label: v.trim() })) : null;
 		},
 		handler: async (args, ctx) => {
 			const text = args.trim();

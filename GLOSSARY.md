@@ -1,7 +1,7 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-21T02:11:56Z
+updated: 2026-10-21T21:53:14Z
 agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
 session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
 ---
@@ -177,3 +177,12 @@ A pass that removes expired state, which correctness may not depend on.
 _Example_: the pass that drops mail acked seven days ago.
 _Not_: the delivery path.
 _Confirmed_: 2026-10-21, Jang, at init
+
+## Language
+
+**Label**:
+Display text the core stores and returns verbatim and never parses: either an agent session's label, which the session gives at Register or any session sets by relabel and which the Board shows beside its Address, or the text between the two integers of a Reference. A session's label may itself contain References.
+_Example_: a session labelled `[[0:FLEET:0]] builder`; `Meteor Shower` in `[[153:Meteor Shower:7]]`.
+_Not_: an Address (a label never routes in the core; a shim may resolve a typed label to an Address before it sends), a claim key, an Opaque integer.
+_Avoid_: name, call sign, rank
+_Confirmed_: 2026-10-21, requested by the director for Jang in the roger-command-polish slice; awaiting Jang's own confirmation.

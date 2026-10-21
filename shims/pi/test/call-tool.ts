@@ -1,6 +1,6 @@
-// Test support, not shipped behaviour: loads the real Pi shim and adds one
-// command per tool that invokes the shim's registered tool callback
-// directly, so the tool path runs in a real Pi runtime without a model call.
+// Test support, not shipped behaviour: loads the real Pi shim and adds
+// commands that invoke the shim's registered tool callbacks directly
+// (/call-roger-send, and /call-roger-tool <name> <json> for any tool), so the tool path runs in a real Pi runtime without a model call.
 // It skips Pi's tool dispatch (argument validation, tool_call hooks).
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import shim from "../roger.ts";
@@ -40,17 +40,6 @@ export default function (pi: ExtensionAPI) {
 			try {
 				const params = JSON.parse(args.trim().slice(name.length).trim() || "{}");
 				const r = await tools[name].execute("direct", params, undefined, undefined, ctx);
-				ctx.ui.notify(`tool result: ${r.content[0].text}`, "info");
-			} catch (e) {
-				ctx.ui.notify(`tool failed: ${(e as Error).message}`, "error");
-			}
-		},
-	});
-	pi.registerCommand("call-roger-board", {
-		description: "Invoke the roger_board tool callback",
-		handler: async (_args, ctx) => {
-			try {
-				const r = await tools.roger_board.execute("direct", {}, undefined, undefined, ctx);
 				ctx.ui.notify(`tool result: ${r.content[0].text}`, "info");
 			} catch (e) {
 				ctx.ui.notify(`tool failed: ${(e as Error).message}`, "error");

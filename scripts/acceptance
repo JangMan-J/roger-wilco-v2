@@ -428,6 +428,11 @@ pi_shim() {
   pi_slash '/call-roger-tool roger_claim {"key":"[[0:build:0]]","ttl_seconds":60}' || fail "Pi did not answer roger_claim"
   wait_for 10 "roger_claim granted" grep -qF '"ok\":true' "$work/tool.out"
   "$bin" board --socket "$work/b.sock" | grep -qF "CLAIM holder=$SENDER " || fail "board lacks the claim taken by roger_claim"
+  # The /roger view shows the claim key JSON-quoted, then its holder verbatim.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "\\\"[[0:build:0]]\\\" — $SENDER (" "$work/tool.out" || fail "/roger does not show the claim key JSON-quoted with its holder"
   pi_slash '/call-roger-tool roger_release {"key":"[[0:build:0]]"}' || fail "Pi did not answer roger_release"
   wait_for 10 "claim released" sh -c "'$bin' board --socket '$work/b.sock' | grep -q 'claims=0'"
   # A /roger relabel whose target does not resolve says so and changes nothing.
@@ -442,7 +447,7 @@ pi_shim() {
   wait_for 10 "mail to an absent Address accepted" grep -qF "\"to\":\"$later\"" "$work/coord.log"
   pi_slash "/roger zzzz nope" || fail "Pi did not answer /roger <unknown>"
   wait_for 10 "unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
-  pi_slash "/call-roger-board" || fail "Pi did not answer /call-roger-board"
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
   wait_for 10 "roger_board tool answered" grep -qF '\"label\":\"Tracer\"' "$work/tool.out"
   grep -qF '\"last_seen_ms\":' "$work/tool.out" || fail "roger_board rows lack last_seen_ms"
   grep -qF '\"connected\":true' "$work/tool.out" || fail "roger_board rows lack connected"
