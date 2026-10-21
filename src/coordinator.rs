@@ -42,7 +42,9 @@ struct State {
     /// Presence: when each Address last acted (register, send, a live ack, a
     /// Board read naming it) or disconnected, on the coordinator clock. Set at
     /// the moment of the event and only read by the Board; memory only, since
-    /// every live session re-registers when its host daemon reconnects.
+    /// every live session re-registers when its host daemon reconnects (and
+    /// that re-registration counts as a Register). Only registered Addresses
+    /// are stamped.
     seen: HashMap<String, i64>,
     /// Addresses whose session connection to their host daemon is open and
     /// whose host daemon's link here is up. Set by Register, cleared by that
@@ -196,6 +198,14 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
     Ok(())
 }
 
+/// Stamp `session` as seen now, for its own act. Only a registered Address is
+/// stamped: a send or Board read naming a stranger leaves no row behind.
+fn stamp(st: &mut State, session: &str) {
+    if st.sessions.contains_key(session) {
+        st.seen.insert(session.to_string(), now_ms());
+    }
+}
+
 /// Record a session's label verbatim. The label is display only: it never
 /// touches the session's Address, host, or pending mail.
 fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
@@ -321,8 +331,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let mut push: Vec<(Writer, Value)> = Vec::new();
                 {
                     let mut st = state.lock().unwrap();
-                    st.seen
-                        .insert(net::field(&v, "from")?.to_string(), now_ms());
+                    stamp(&mut st, net::field(&v, "from")?);
                     if net::field(&v, "to")? == BROADCAST {
                         push = broadcast(
                             &mut st,
@@ -384,16 +393,32 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let session = net::field(&v, "session")?.to_string();
                 let label = net::field(&v, "label")?.to_string();
-                set_label(&mut state.lock().unwrap(), &session, &label)?;
-                net::send(
-                    &writer,
-                    &obj(vec![
-                        ("type", s("relabeled")),
-                        ("req", Value::Int(req)),
-                        ("session", s(&session)),
-                        ("label", s(&label)),
-                    ]),
-                )?;
+                let reply = {
+                    let mut st = state.lock().unwrap();
+                    // A label belongs to a session: an Address that never
+                    // registered gets none, so no label can be parked on it.
+                    if st.sessions.contains_key(&session) {
+                        set_label(&mut st, &session, &label)?;
+                        obj(vec![
+                            ("type", s("relabeled")),
+                            ("req", Value::Int(req)),
+                            ("session", s(&session)),
+                            ("label", s(&label)),
+                        ])
+                    } else {
+                        obj(vec![
+                            ("type", s("error")),
+                            ("req", Value::Int(req)),
+                            (
+                                "reason",
+                                s(&format!(
+                                    "expected a registered session to relabel, saw {session}"
+                                )),
+                            ),
+                        ])
+                    }
+                };
+                net::send(&writer, &reply)?;
             }
             "ack" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -405,7 +430,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     // A replayed receipt was acked earlier, while this link
                     // was down; it is not the session's activity now.
                     if v.get("replay") != Some(&Value::Bool(true)) {
-                        st.seen.insert(session.clone(), now_ms());
+                        stamp(&mut st, &session);
                     }
                     match st.mails.get(&mail) {
                         None => None,
@@ -460,7 +485,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     // A Board read that names its reader is that session's own
                     // activity.
                     if let Ok(reader) = net::field(&v, "session") {
-                        st.seen.insert(reader.to_string(), now_ms());
+                        stamp(&mut st, reader);
                     }
                     board(&st, &v)
                 };
@@ -523,12 +548,20 @@ fn holder_fields(pairs: &mut Vec<(&str, Value)>, holder: Option<&Held>, now: i64
 fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let op_name = net::field(v, "op")?;
-    let op = Op::parse(op_name).ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidData,
-            format!("expected op acquire, renew, or release; saw {op_name}"),
-        )
-    })?;
+    // A bad op is answered, not fatal: an error here would drop the whole
+    // host daemon's link.
+    let Some(op) = Op::parse(op_name) else {
+        return Ok(obj(vec![
+            ("type", s("error")),
+            ("req", Value::Int(req)),
+            (
+                "reason",
+                s(&format!(
+                    "expected op acquire, renew, or release; saw {op_name}"
+                )),
+            ),
+        ]));
+    };
     let key = net::field(v, "key")?.to_string();
     let owner = net::field(v, "owner")?.to_string();
     let ttl_ms = v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -627,6 +660,9 @@ fn board(st: &State, v: &Value) -> Value {
         ("req", Value::Int(req)),
         ("sessions", Value::Arr(sessions)),
         ("claims", Value::Arr(claims)),
+        // The clock every last_seen_ms and remaining_ms above was read
+        // against, so a reader on another host measures age without skew.
+        ("now_ms", Value::Int(now)),
     ])
 }
 

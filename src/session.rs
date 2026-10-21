@@ -126,7 +126,7 @@ fn shim_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
         ),
         other => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!("unknown request {other}"),
+            format!("expected request send, board, relabel, or claim; saw {other}"),
         )),
     }
 }

@@ -1370,6 +1370,10 @@ fn presence_is_the_open_session_connection_then_own_activity() {
     std::thread::sleep(Duration::from_millis(50));
     assert_eq!(presence(&rig, "a.sock", None), (false, gone));
 
+    // Mail sent to it is not its act: no Register, no ack, no stamp.
+    rig.send("m-presence-0", "while it is gone");
+    assert_eq!(presence(&rig, "a.sock", None), (false, gone));
+
     // Its own Board read and send are its activity.
     std::thread::sleep(Duration::from_millis(5));
     let (_, read_at) = presence(&rig, "a.sock", Some(RECIPIENT));
@@ -1441,4 +1445,75 @@ fn a_replayed_ack_is_not_activity() {
     }
     wait_until_board_reaches_both(&rig);
     assert_eq!(presence(&rig, "a.sock", None), (false, 0));
+}
+
+/// One raw request line on a host daemon socket, answered by one line.
+fn raw_request(rig: &Rig, sock: &str, line: &str) -> String {
+    let mut conn = std::os::unix::net::UnixStream::connect(rig.p(sock)).unwrap();
+    writeln!(conn, "{line}").unwrap();
+    let mut answer = String::new();
+    let mut byte = [0u8; 1];
+    while conn.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+        answer.push(byte[0] as char);
+    }
+    answer
+}
+
+/// A claim with an unknown op is refused with a reason, and the host
+/// daemon's link to the coordinator stays up.
+#[test]
+fn an_unknown_claim_op_is_refused_without_dropping_the_host_link() {
+    let mut rig = Rig::new("claim-bad-op");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    wait_connected(&rig, "a.sock", true);
+    let answer = raw_request(
+        &rig,
+        "b.sock",
+        &format!(
+            r#"{{"type":"claim","req":7,"op":"steal","key":"k","owner":"{RECIPIENT}","ttl_ms":1000}}"#
+        ),
+    );
+    assert!(answer.contains(r#""type":"error""#), "{answer}");
+    assert!(
+        answer.contains("expected op acquire, renew, or release; saw steal"),
+        "{answer}"
+    );
+    let coord_err = read(&rig.p("coord.out.err"));
+    assert!(!coord_err.contains("connection ended"), "{coord_err}");
+    let daemon_err = read(&rig.p("daemon-b.out.err"));
+    assert!(!daemon_err.contains("upstream"), "{daemon_err}");
+}
+
+/// Relabel names a registered session; an Address nobody registered gets no
+/// label and no log row.
+#[test]
+fn relabel_of_an_unregistered_address_is_refused() {
+    let mut rig = Rig::new("relabel-stranger");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    let label = |who: &str| {
+        Command::new(BIN)
+            .args([
+                "label",
+                "--socket",
+                rig.p("a.sock").to_str().unwrap(),
+                "--from",
+                who,
+                "--label",
+                "parked",
+            ])
+            .output()
+            .unwrap()
+    };
+    let refused = label(SENDER);
+    assert!(!refused.status.success(), "{refused:?}");
+    assert!(
+        String::from_utf8_lossy(&refused.stderr)
+            .contains("expected a registered session to relabel"),
+        "{refused:?}"
+    );
+    assert!(label(RECIPIENT).status.success());
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"label\""), 1, "{coord}");
 }

@@ -22,8 +22,9 @@ import { registerRogerCommand } from "./roger-command.ts";
 
 type Reply = Record<string, unknown>;
 type Pending = { ok: (reply: Reply) => void; fail: (e: Error) => void };
-// Adapter lines that answer a request, one per request, in request order.
-const REPLIES = new Set(["accepted", "board", "relabeled", "claim_result"]);
+// The adapter answers each request line exactly once, in order; `ready` and
+// `mail` are its only unsolicited lines, so every other line is the oldest
+// pending request's answer.
 
 /** The declared wake latency in ms, or undefined when wake is off. */
 export function wakeLatency(env: string | undefined): number | undefined {
@@ -78,9 +79,8 @@ export default function (pi: ExtensionAPI) {
 				return; // not an adapter event; nothing to correlate it with
 			}
 			if (ev.type === "ready") me = ev.session;
-			else if (REPLIES.has(ev.type)) pending.shift()?.ok(ev);
-			else if (ev.type === "error") pending.shift()?.fail(new Error(ev.error));
-			else if (ev.type === "mail" && !seen.has(ev.record)) {
+			else if (ev.type === "mail") {
+				if (seen.has(ev.record)) return;
 				seen.add(ev.record);
 				const wake = wakeMs !== undefined && ev.wake !== false;
 				// Idle: triggerTurn starts a turn now. Busy: followUp waits for the
@@ -94,7 +94,8 @@ export default function (pi: ExtensionAPI) {
 					},
 					wake ? { triggerTurn: true, deliverAs: "followUp" } : { triggerTurn: false },
 				);
-			}
+			} else if (ev.type === "error") pending.shift()?.fail(new Error(ev.error));
+			else pending.shift()?.ok(ev);
 		});
 	};
 
@@ -105,7 +106,12 @@ export default function (pi: ExtensionAPI) {
 			pending.push({ ok, fail });
 			adapter.stdin.write(JSON.stringify(req) + "\n");
 		});
-	const send = async (to: string, body: string) => (await request({ type: "send", to, body })).mail as string;
+	const send = async (to: string, body: string) => {
+		const r = await request({ type: "send", to, body });
+		if (r.type !== "accepted" || typeof r.mail !== "string")
+			throw new Error(`expected accepted with a mail id, saw ${JSON.stringify(r)}`);
+		return r.mail;
+	};
 
 	pi.on("session_start", async () => start());
 	pi.on("session_shutdown", async () => {

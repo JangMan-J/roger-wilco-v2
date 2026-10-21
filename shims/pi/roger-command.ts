@@ -11,6 +11,7 @@
 // `/roger all` and roger_board {all: true} skip the filter.
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { BROADCAST, present, resolve, windowMs, type Row } from "./roger-target.ts";
 
 type Reply = Record<string, unknown>;
 export type Core = {
@@ -18,17 +19,21 @@ export type Core = {
 	request: (req: Reply) => Promise<Reply>;
 	send: (to: string, body: string) => Promise<string>;
 };
-type Row = { session: string; host: string; label: string; connected: boolean; last_seen_ms: number };
 type ClaimRow = { key: string; holder?: string; remaining_ms?: number };
-type Board = { sessions: Row[]; claims: ClaimRow[] };
+/** One Board read; `now` is the coordinator's clock at that read. */
+type Board = { sessions: Row[]; claims: ClaimRow[]; now: number };
 
-const BROADCAST = "*";
-const WINDOW_MS = Number(process.env.ROGER_PRESENCE_WINDOW_MS) || 10 * 60_000;
-const USAGE =
-	"Usage: /roger [all] | /roger <address|prefix|label|*> [message] | /roger label [address|prefix|label] <text> | /roger help";
-
-const present = (r: Row, now: number) =>
-	r.connected || (r.last_seen_ms > 0 && now - r.last_seen_ms <= WINDOW_MS);
+const WINDOW_MS = windowMs(process.env.ROGER_PRESENCE_WINDOW_MS);
+const USAGE = [
+	"Usage:",
+	"  /roger [all]                          the Board (all: include stale sessions), then a picker",
+	"  /roger <target> [message]             message one session; no message opens the editor",
+	"  /roger * [message]                    broadcast to every registered session",
+	"  /roger label <text>                   set this session's label",
+	"  /roger relabel <target> <text>        set another session's label",
+	'A target is an address, a unique address prefix (3+ hex), or a label; write @<label> or @"<label>" for a label',
+	"that is a keyword or that another label also fits.",
+].join("\n");
 
 const ago = (r: Row, now: number) =>
 	r.connected
@@ -37,40 +42,24 @@ const ago = (r: Row, now: number) =>
 		? `last seen ${new Date(r.last_seen_ms).toISOString()} (${Math.max(0, Math.floor((now - r.last_seen_ms) / 1000))}s ago)`
 		: "last seen unknown";
 
-/** A target is `*`, an Address, a label one session shows, or a unique Address prefix (3+ chars). */
-type Target = { to: string; row?: Row; rest: string };
-function resolve(rows: Row[], text: string): Target | string {
-	const first = text.split(/\s+/, 1)[0] ?? "";
-	const after = (n: number) => text.slice(n).trim();
-	if (first === BROADCAST) return { to: BROADCAST, rest: after(1) };
-	const exact = rows.find((r) => r.session === first);
-	if (exact) return { to: exact.session, row: exact, rest: after(first.length) };
-	// A label may hold spaces: take the longest label the text starts with.
-	// Labels are compared as typed text; nothing reads the integers in one.
-	const fits = rows.filter((r) => r.label && (text === r.label || text.startsWith(r.label + " ")));
-	const longest = Math.max(0, ...fits.map((r) => r.label.length));
-	const byLabel = fits.filter((r) => r.label.length === longest);
-	if (byLabel.length === 1) return { to: byLabel[0]!.session, row: byLabel[0], rest: after(longest) };
-	if (byLabel.length > 1)
-		return `ambiguous label ${JSON.stringify(byLabel[0]!.label)}: ${byLabel.map((r) => r.session).join(", ")}`;
-	const byPrefix = first.length >= 3 ? rows.filter((r) => r.session.startsWith(first)) : [];
-	if (byPrefix.length === 1) return { to: byPrefix[0]!.session, row: byPrefix[0], rest: after(first.length) };
-	if (byPrefix.length > 1)
-		return `ambiguous target ${JSON.stringify(first)}: ${byPrefix.map((r) => r.session).join(", ")}`;
-	return `no session matches ${JSON.stringify(first)}`;
-}
-
 export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
-	const board = async (): Promise<Board> => {
-		const b = await core.request({ type: "board" });
-		return { sessions: (b.sessions as Row[]) ?? [], claims: (b.claims as ClaimRow[]) ?? [] };
+	/** One adapter request whose answer must be of type `want`. */
+	const ask = async (req: Reply, want: string) => {
+		const r = await core.request(req);
+		if (r.type !== want) throw new Error(`expected ${want}, saw ${JSON.stringify(r)}`);
+		return r;
 	};
-	const view = (b: Board, all: boolean, now: number): Board => ({
-		sessions: all ? b.sessions : b.sessions.filter((r) => present(r, now)),
-		claims: b.claims,
+	const board = async (): Promise<Board> => {
+		const b = await ask({ type: "board" }, "board");
+		const now = typeof b.now_ms === "number" ? b.now_ms : Date.now();
+		return { sessions: (b.sessions as Row[]) ?? [], claims: (b.claims as ClaimRow[]) ?? [], now };
+	};
+	const view = (b: Board, all: boolean): Board => ({
+		...b,
+		sessions: all ? b.sessions : b.sessions.filter((r) => present(r, b.now, WINDOW_MS)),
 	});
 	const relabel = async (label: string, session?: string) =>
-		(await core.request({ type: "relabel", label, ...(session ? { session } : {}) })) as {
+		(await ask({ type: "relabel", label, ...(session ? { session } : {}) }, "relabeled")) as {
 			session: string;
 			label: string;
 		};
@@ -79,7 +68,8 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 	const claimText = (c: ClaimRow) =>
 		`${c.key} — ${c.holder ?? "?"}${c.remaining_ms !== undefined ? ` (${Math.ceil(c.remaining_ms / 1000)}s left)` : ""}`;
 
-	const boardText = (full: Board, shown: Board, all: boolean, now: number) => {
+	const boardText = (full: Board, shown: Board, all: boolean) => {
+		const now = full.now;
 		const own = full.sessions.find((r) => r.session === core.me());
 		return [
 			"Roger-Wilco",
@@ -95,7 +85,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			"Connected means its session connection and host link are open, not that it is working.",
 			"Labels are display only; the core routes by address.",
 			...(all ? [] : ["Use /roger all to include stale sessions."]),
-			"Pick a session to message it or set its label, or use /roger <address|prefix|label|*> <message>.",
+			"Pick a session to message it or set its label, or use /roger <target|*> <message> (/roger help).",
 		].join("\n");
 	};
 
@@ -109,7 +99,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 		description: "Show the Board, message a session or broadcast, or set a label: /roger help",
 		getArgumentCompletions: async (prefix: string) => {
 			const words = prefix.split(" ");
-			if (words.length > 2 || (words.length === 2 && words[0] !== "label")) return null;
+			if (words.length > 2 || (words.length === 2 && words[0] !== "relabel")) return null;
 			const last = words[words.length - 1]!;
 			let rows: Row[] = [];
 			try {
@@ -118,8 +108,9 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 				// no adapter: complete keywords only
 			}
 			const targets = rows.flatMap((r) => [r.session, ...(r.label ? [r.label] : [])]).map((v) => v + " ");
-			const values = words.length === 1 ? ["all", "help", "label ", BROADCAST + " ", ...targets] : targets;
-			const lead = words.length === 2 ? "label " : "";
+			const values =
+				words.length === 1 ? ["all", "help", "label ", "relabel ", BROADCAST + " ", ...targets] : targets;
+			const lead = words.length === 2 ? "relabel " : "";
 			const hits = [...new Set(values)].filter((v) => v.startsWith(last));
 			return hits.length ? hits.map((v) => ({ value: lead + v, label: v.trim() })) : null;
 		},
@@ -129,27 +120,32 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			try {
 				if (words[0] === "help") return ctx.ui.notify(USAGE, "info");
 				if (words[0] === "label") {
-					// /roger label <text>                → this session
-					// /roger label <target> <text>       → that session
-					const rest = text.slice("label".length).trim();
-					const hit = words.length > 2 ? resolve((await board()).sessions, rest) : undefined;
-					const [session, label] =
-						typeof hit === "object" && hit.row ? [hit.row.session, hit.rest] : [undefined, rest];
+					const label = text.slice("label".length).trim();
 					if (!label) return ctx.ui.notify(USAGE, "warning");
-					const r = await relabel(label, session);
+					const r = await relabel(label);
 					return ctx.ui.notify(`${r.session} is now ${r.label}`, "info");
 				}
-				if (words.length && words[0] !== "all") {
+				if (words[0] === "relabel") {
+					const hit = resolve((await board()).sessions, text.slice("relabel".length));
+					if (typeof hit === "string") return ctx.ui.notify(hit, "error");
+					if (!hit.row) return ctx.ui.notify(`${hit.to} is not a session on the Board`, "error");
+					if (!hit.rest) return ctx.ui.notify(USAGE, "warning");
+					const r = await relabel(hit.rest, hit.row.session);
+					return ctx.ui.notify(`${r.session} is now ${r.label}`, "info");
+				}
+				if (words.length && text !== "all") {
 					const hit = resolve((await board()).sessions, text);
 					if (typeof hit === "string") return ctx.ui.notify(hit, "error");
-					const title = hit.row ? `Message to ${rowText(hit.row)}` : "Broadcast to every registered session";
+					const title =
+						hit.to === BROADCAST
+							? "Broadcast to every registered session"
+							: `Message to ${hit.row ? rowText(hit.row) : hit.to}`;
 					return await sendTo(ctx, hit.to, title, hit.rest);
 				}
-				const all = words[0] === "all";
-				const now = Date.now();
+				const all = text === "all";
 				const full = await board();
-				const shown = view(full, all, now);
-				ctx.ui.notify(boardText(full, shown, all, now), "info");
+				const shown = view(full, all);
+				ctx.ui.notify(boardText(full, shown, all), "info");
 				if (!ctx.hasUI) return;
 				const viewOnly = "View only (no changes)";
 				const broadcast = "Broadcast message…";
@@ -188,7 +184,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 				all: Type.Optional(Type.Boolean({ description: "include sessions neither connected nor seen recently" })),
 			}),
 			async execute(_id, params) {
-				return json({ me: core.me(), ...view(await board(), params.all ?? false, Date.now()) });
+				return json({ me: core.me(), ...view(await board(), params.all ?? false) });
 			},
 		}),
 	);
@@ -219,7 +215,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			}),
 			async execute(_id, params) {
 				const ttl_ms = (params.ttl_seconds ?? 900) * 1000;
-				return json(await core.request({ type: "claim", op: "acquire", key: params.key, ttl_ms }));
+				return json(await ask({ type: "claim", op: "acquire", key: params.key, ttl_ms }, "claim_result"));
 			},
 		}),
 	);
@@ -231,7 +227,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			description: "Release a claim this session holds, by its exact key.",
 			parameters: Type.Object({ key: Type.String({ description: "claim key, exactly as claimed" }) }),
 			async execute(_id, params) {
-				return json(await core.request({ type: "claim", op: "release", key: params.key }));
+				return json(await ask({ type: "claim", op: "release", key: params.key }, "claim_result"));
 			},
 		}),
 	);

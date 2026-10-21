@@ -12,4 +12,5 @@ step cargo clippy --offline --all-targets -- -D warnings
 step cargo test --offline
 step scripts/check-harness-free
 step scripts/check-no-poll
+step node --test shims/pi/test/roger-target.test.ts
 echo "PASS check"

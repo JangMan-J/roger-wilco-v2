@@ -397,7 +397,7 @@ pi_shim() {
   wait_for 10 "own label confirmed" grep -qF "$SENDER is now [[0:FLEET:0]] pi" "$work/tool.out"
   "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a connected=true last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
     || fail "board does not show the label set by /roger label: $("$bin" board --socket "$work/a.sock")"
-  pi_slash "/roger label $RECIPIENT Tracer" || fail "Pi did not answer /roger label <address>"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
   wait_for 10 "tracer label confirmed" grep -qF "$RECIPIENT is now Tracer" "$work/tool.out"
   # /roger with no args: the Board, then the picker. Pick the tracer, choose
   # "Set label…", and type a new label; the Board shows it.
@@ -411,7 +411,7 @@ pi_shim() {
   grep -qF "Your host: host-a" "$work/tool.out" || fail "/roger board lacks the own host"
   grep -qF "$RECIPIENT — host host-b — Tracer" "$work/tool.out" || fail "/roger board lacks the tracer row with its label"
   grep -qF "$SENDER (you) — host host-a — [[0:FLEET:0]] pi" "$work/tool.out" || fail "/roger board lacks the own row"
-  pi_slash "/roger label $RECIPIENT Tracer" || fail "Pi did not answer /roger label <address>"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
   pi_slash "/roger ${RECIPIENT:0:8} by prefix [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger <prefix>"
   wait_for 15 "prefix-addressed mail stored" log_count "by prefix [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
   pi_slash "/roger Tracer by label [[0:FLEET:0]]" || fail "Pi did not answer /roger <label>"
@@ -430,6 +430,16 @@ pi_shim() {
   "$bin" board --socket "$work/b.sock" | grep -qF "CLAIM holder=$SENDER " || fail "board lacks the claim taken by roger_claim"
   pi_slash '/call-roger-tool roger_release {"key":"[[0:build:0]]"}' || fail "Pi did not answer roger_release"
   wait_for 10 "claim released" sh -c "'$bin' board --socket '$work/b.sock' | grep -q 'claims=0'"
+  # A /roger relabel whose target does not resolve says so and changes nothing.
+  pi_slash "/roger relabel zzzz nope" || fail "Pi did not answer /roger relabel <unknown>"
+  wait_for 10 "relabel of an unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -q "^SESSION address=$SENDER .* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "/roger relabel <unknown> changed this session's label"
+  # A full Address not on the Board still routes: the core holds the Mail
+  # until that Address registers.
+  local later="55555555-5555-4555-8555-555555555555"
+  pi_slash "/roger $later for whoever registers [[0:FLEET:0]]" || fail "Pi did not answer /roger <absent address>"
+  wait_for 10 "mail to an absent Address accepted" grep -qF "\"to\":\"$later\"" "$work/coord.log"
   pi_slash "/roger zzzz nope" || fail "Pi did not answer /roger <unknown>"
   wait_for 10 "unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
   pi_slash "/call-roger-board" || fail "Pi did not answer /call-roger-board"
@@ -462,9 +472,17 @@ pi_shim() {
   pi_ui select '{value:"View only (no changes)"}'
   pi_answered
   grep -qF "$gone — host host-b — last seen" "$work/idle.out" || fail "/roger all lacks the disconnected session"
+  # roger_board applies the same filter, against the coordinator's clock.
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
+  wait_for 10 "roger_board answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 1"
+  grep 'tool result: ' "$work/idle.out" | grep -qF "$gone" && fail "roger_board default view shows a session whose connection closed"
+  grep 'tool result: ' "$work/idle.out" | grep -qF '\"now\":' || fail "roger_board lacks the coordinator's now"
+  pi_slash '/call-roger-tool roger_board {"all":true}' || fail "Pi did not answer roger_board all"
+  wait_for 10 "roger_board all answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 2"
+  grep 'tool result: ' "$work/idle.out" | tail -n1 | grep -qF "$gone" || fail "roger_board all lacks the disconnected session"
   pi_stop
 
-  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label, board (present and all; an idle connected session stays present past the window, a closed one drops out), address-prefix, label and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label and relabel, board (present and all, in /roger and roger_board; an idle connected session stays present past the window, a closed one drops out), address-prefix, label, absent-Address and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
 }
 
 # Proof 4. Two hosts, one coordinator. A on decent-spider and B on agent-jail
