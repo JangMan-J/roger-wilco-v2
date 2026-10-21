@@ -3,9 +3,11 @@
 // roger_claim and roger_release tools. Everything goes through the adapter
 // request lines that roger.ts owns; nothing here touches delivery or acks.
 //
-// Presence: the Board gives each session's last_seen_ms (its last register,
-// send, ack or Board read). Which sessions count as recent is decided here,
-// at read time, against ROGER_PRESENCE_WINDOW_MS (default 10 minutes).
+// Presence: the Board says whether each session is connected (its session
+// connection and its host daemon's link are open) and gives last_seen_ms (the
+// read time while connected, else its disconnect or last own activity). The
+// default view is decided here, at read time: connected sessions plus any seen
+// within ROGER_PRESENCE_WINDOW_MS (default 10 minutes).
 // `/roger all` and roger_board {all: true} skip the filter.
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI, type ExtensionContext } from "@earendil-works/pi-coding-agent";
@@ -16,7 +18,7 @@ export type Core = {
 	request: (req: Reply) => Promise<Reply>;
 	send: (to: string, body: string) => Promise<string>;
 };
-type Row = { session: string; host: string; label: string; last_seen_ms: number };
+type Row = { session: string; host: string; label: string; connected: boolean; last_seen_ms: number };
 type ClaimRow = { key: string; holder?: string; remaining_ms?: number };
 type Board = { sessions: Row[]; claims: ClaimRow[] };
 
@@ -25,10 +27,13 @@ const WINDOW_MS = Number(process.env.ROGER_PRESENCE_WINDOW_MS) || 10 * 60_000;
 const USAGE =
 	"Usage: /roger [all] | /roger <address|prefix|label|*> [message] | /roger label [address|prefix|label] <text> | /roger help";
 
-const recent = (r: Row, now: number) => r.last_seen_ms > 0 && now - r.last_seen_ms <= WINDOW_MS;
+const present = (r: Row, now: number) =>
+	r.connected || (r.last_seen_ms > 0 && now - r.last_seen_ms <= WINDOW_MS);
 
 const ago = (r: Row, now: number) =>
-	r.last_seen_ms > 0
+	r.connected
+		? "connected"
+		: r.last_seen_ms > 0
 		? `last seen ${new Date(r.last_seen_ms).toISOString()} (${Math.max(0, Math.floor((now - r.last_seen_ms) / 1000))}s ago)`
 		: "last seen unknown";
 
@@ -61,7 +66,7 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 		return { sessions: (b.sessions as Row[]) ?? [], claims: (b.claims as ClaimRow[]) ?? [] };
 	};
 	const view = (b: Board, all: boolean, now: number): Board => ({
-		sessions: all ? b.sessions : b.sessions.filter((r) => recent(r, now)),
+		sessions: all ? b.sessions : b.sessions.filter((r) => present(r, now)),
 		claims: b.claims,
 	});
 	const relabel = async (label: string, session?: string) =>
@@ -81,13 +86,13 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			`Your address: ${core.me() || "(unknown: adapter not ready)"}`,
 			`Your host: ${own ? own.host : "(not on the Board)"}`,
 			"",
-			`${all ? "All registered sessions" : `Recent sessions (seen within ${Math.round(WINDOW_MS / 1000)}s)`} (${shown.sessions.length}):`,
+			`${all ? "All registered sessions" : `Present sessions (connected or seen within ${Math.round(WINDOW_MS / 1000)}s)`} (${shown.sessions.length}):`,
 			...shown.sessions.map((r, i) => `${i + 1}. ${rowText(r)} — ${ago(r, now)}`),
 			"",
 			`Active claims (${shown.claims.length}):`,
 			...shown.claims.map(claimText),
 			"",
-			"Presence is a session's last register, send, ack or Board read, not proof that it is alive.",
+			"Connected means its session connection and host link are open, not that it is working.",
 			"Labels are display only; the core routes by address.",
 			...(all ? [] : ["Use /roger all to include stale sessions."]),
 			"Pick a session to message it or set its label, or use /roger <address|prefix|label|*> <message>.",
@@ -176,11 +181,11 @@ export function registerRogerCommand(pi: ExtensionAPI, core: Core): void {
 			name: "roger_board",
 			label: "Roger board",
 			description:
-				"Read the Board: registered sessions (address, host, label, last_seen_ms) and active claims. " +
-				`By default only sessions seen within ${Math.round(WINDOW_MS / 1000)}s; set all to include stale ones. ` +
-				"Presence is a session's last activity, not proof that it is alive.",
+				"Read the Board: registered sessions (address, host, label, connected, last_seen_ms) and active claims. " +
+				`By default only sessions connected or seen within ${Math.round(WINDOW_MS / 1000)}s; set all to include stale ones. ` +
+				"Connected means the session's connection is open, not that it is working.",
 			parameters: Type.Object({
-				all: Type.Optional(Type.Boolean({ description: "include sessions not seen recently" })),
+				all: Type.Optional(Type.Boolean({ description: "include sessions neither connected nor seen recently" })),
 			}),
 			async execute(_id, params) {
 				return json({ me: core.me(), ...view(await board(), params.all ?? false, Date.now()) });

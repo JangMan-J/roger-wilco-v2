@@ -209,7 +209,13 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         eprintln!("upstream connected, replaying {} receipts", receipts.len());
     }
     for r in &receipts {
-        let _ = net::send(&writer, &net::ack_msg(&r.mail, &r.session, &r.record));
+        // Marked as a replay: the session acked earlier, so this is not its
+        // activity now.
+        let mut ack = net::ack_msg(&r.mail, &r.session, &r.record);
+        if let Value::Obj(pairs) = &mut ack {
+            pairs.push(("replay".to_string(), Value::Bool(true)));
+        }
+        let _ = net::send(&writer, &ack);
     }
     for line in lines {
         let v = line?;
@@ -357,10 +363,33 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     // Whatever ended the connection, a dead Writer must not stay registered:
     // the daemon would re-register that session upstream and push pending
     // mail to a closed socket.
+    // Only this connection's own registration is removed: a session that
+    // re-registered on a newer connection is still connected.
     if let Some(id) = session_id {
-        let mut st = state.lock().unwrap();
-        st.sessions.remove(&id);
-        st.declared.remove(&id);
+        let upstream = {
+            let mut st = state.lock().unwrap();
+            if st
+                .sessions
+                .get(&id)
+                .is_some_and(|w| Arc::ptr_eq(w, &writer))
+            {
+                st.sessions.remove(&id);
+                st.declared.remove(&id);
+                st.upstream.clone()
+            } else {
+                None
+            }
+        };
+        // The session's connection closing is the committed event that ends
+        // its presence. With no upstream there is nothing to tell: the
+        // coordinator marked this host's sessions disconnected when the link
+        // dropped, and the reconnect re-registers only live ones.
+        if let Some(up) = upstream {
+            let _ = net::send(
+                &up,
+                &obj(vec![("type", s("disconnect")), ("session", s(&id))]),
+            );
+        }
     }
     result
 }

@@ -1273,9 +1273,10 @@ fn declared_text_reaches_the_board_verbatim_and_survives_a_coordinator_restart()
     );
 }
 
-/// The Board row's `last_seen_ms` for `session`, read by `reader` (if any).
-fn last_seen(rig: &Rig, reader: Option<&str>) -> i64 {
-    let sock = rig.p("a.sock");
+/// RECIPIENT's Board row as (connected, last_seen_ms), read through `sock`
+/// by `reader` (if any).
+fn presence(rig: &Rig, sock: &str, reader: Option<&str>) -> (bool, i64) {
+    let sock = rig.p(sock);
     let mut args = vec!["board", "--socket", sock.to_str().unwrap()];
     if let Some(r) = reader {
         args.extend(["--from", r]);
@@ -1287,34 +1288,44 @@ fn last_seen(rig: &Rig, reader: Option<&str>) -> i64 {
         .lines()
         .find(|l| l.starts_with(&format!("SESSION address={RECIPIENT} ")))
         .unwrap_or_else(|| panic!("no row for {RECIPIENT}: {out}"));
-    let field = line
-        .split(' ')
-        .find_map(|w| w.strip_prefix("last_seen_ms="))
-        .unwrap_or_else(|| panic!("no last_seen_ms: {line}"));
-    field.parse().unwrap()
+    let field = |name: &str| {
+        line.split(' ')
+            .find_map(|w| w.strip_prefix(name))
+            .unwrap_or_else(|| panic!("no {name}: {line}"))
+            .to_string()
+    };
+    (
+        field("connected=") == "true",
+        field("last_seen_ms=").parse().unwrap(),
+    )
 }
 
-#[test]
-fn presence_follows_a_sessions_own_activity_and_nothing_else() {
-    let mut rig = Rig::new("presence");
-    rig.start_stack();
-    rig.start_recipient("recipient.out", false);
+/// Wait until RECIPIENT's `connected` reads `want` through `sock`.
+fn wait_connected(rig: &Rig, sock: &str, want: bool) -> i64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // A board read fails outright while a host daemon is reconnecting.
+        let ok = Command::new(BIN)
+            .args(["board", "--socket", rig.p(sock).to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if ok {
+            let (connected, seen) = presence(rig, sock, None);
+            if connected == want {
+                return seen;
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{RECIPIENT} never became connected={want}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
 
-    // Register sets it.
-    let registered = last_seen(&rig, None);
-    assert!(registered > 0, "register must set last_seen_ms");
-
-    // Nothing refreshes it on a clock: an anonymous read, after a pause, sees
-    // the same value.
-    std::thread::sleep(Duration::from_millis(50));
-    assert_eq!(last_seen(&rig, None), registered);
-
-    // A Board read naming the session is its own activity.
-    let read_at = last_seen(&rig, Some(RECIPIENT));
-    assert!(read_at > registered, "{read_at} > {registered}");
-
-    // A send from it, then an ack by it, each move it forward.
-    std::thread::sleep(Duration::from_millis(5));
+fn send_from_recipient(rig: &Rig, mail: &str) {
     let sent = Command::new(BIN)
         .args([
             "send",
@@ -1325,23 +1336,109 @@ fn presence_follows_a_sessions_own_activity_and_nothing_else() {
             "--to",
             SENDER,
             "--mail",
-            "m-presence-1",
+            mail,
             "--body",
             "out",
         ])
         .output()
         .unwrap();
     assert!(sent.status.success(), "{sent:?}");
-    let after_send = last_seen(&rig, None);
+}
+
+/// An idle session is present for as long as its connection is open; once it
+/// closes, last_seen_ms is the disconnect moment and only the session's own
+/// activity moves it.
+#[test]
+fn presence_is_the_open_session_connection_then_own_activity() {
+    let mut rig = Rig::new("presence");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient.out", false);
+
+    // Connected and idle: last seen is the moment of each read.
+    let (connected, first) = presence(&rig, "a.sock", None);
+    assert!(connected);
+    std::thread::sleep(Duration::from_millis(50));
+    let (connected, later) = presence(&rig, "a.sock", None);
+    assert!(connected);
+    assert!(later >= first + 50, "{later} >= {first} + 50");
+
+    // The connection closes: disconnected at that moment, and nothing
+    // refreshes it on a clock.
+    rig.kill(recipient);
+    let gone = wait_connected(&rig, "a.sock", false);
+    assert!(gone >= later, "{gone} >= {later}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(presence(&rig, "a.sock", None), (false, gone));
+
+    // Its own Board read and send are its activity.
+    std::thread::sleep(Duration::from_millis(5));
+    let (_, read_at) = presence(&rig, "a.sock", Some(RECIPIENT));
+    assert!(read_at > gone, "{read_at} > {gone}");
+    std::thread::sleep(Duration::from_millis(5));
+    send_from_recipient(&rig, "m-presence-1");
+    let (connected, after_send) = presence(&rig, "a.sock", None);
+    assert!(!connected);
     assert!(after_send > read_at, "{after_send} > {read_at}");
 
-    std::thread::sleep(Duration::from_millis(5));
-    rig.send("m-presence-2", "in");
+    // Registering again makes it connected again.
+    rig.start_recipient("recipient2.out", false);
+    wait_connected(&rig, "a.sock", true);
+}
+
+/// A host daemon's link dropping disconnects its sessions; a coordinator
+/// that comes back learns who is connected from the re-registration alone.
+#[test]
+fn host_link_drop_disconnects_its_sessions_and_reregistration_restores_them() {
+    let mut rig = Rig::new("presence-link");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    wait_connected(&rig, "a.sock", true);
+
+    // A fresh coordinator holds no presence; host-b's re-registration of its
+    // live session restores it.
+    rig.restart_coordinator();
+    wait_connected(&rig, "a.sock", true);
+
+    // host-b's daemon dies, so it can report nothing: the dropped link alone
+    // marks its session disconnected.
+    let before = presence(&rig, "a.sock", None).1;
+    rig.kill(2);
+    let gone = wait_connected(&rig, "a.sock", false);
+    assert!(gone >= before, "{gone} >= {before}");
+}
+
+/// A receipt the host daemon replays after its link returns was acked while
+/// the link was down; it is not the session's activity.
+#[test]
+fn a_replayed_ack_is_not_activity() {
+    let mut rig = Rig::new("presence-replay");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+    rig.send("m-replay", "acked while the coordinator is down");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+
+    rig.kill(0);
+    rig.kill(recipient);
+    let recipient = rig.start_recipient("recipient2.out", true);
     wait_for_text(
-        &rig.p("recipient.out"),
-        "DELIVERED mail=m-presence-2",
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-replay record=r-1",
         Duration::from_secs(10),
     );
-    let after_ack = last_seen(&rig, None);
-    assert!(after_ack > after_send, "{after_ack} > {after_send}");
+    rig.kill(recipient);
+
+    // The new coordinator hears only the replayed receipt for RECIPIENT: no
+    // Register, no live ack.
+    rig.restart_coordinator();
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while count_lines_with(
+        &read(&rig.p("coord.log")),
+        "\"ev\":\"receipt\",\"mail\":\"m-replay\"",
+    ) == 0
+    {
+        assert!(Instant::now() < deadline, "receipt never replayed");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    wait_until_board_reaches_both(&rig);
+    assert_eq!(presence(&rig, "a.sock", None), (false, 0));
 }

@@ -395,7 +395,7 @@ pi_shim() {
   # address prefix and by label. ctx.ui.notify text lands in Pi's rpc output.
   pi_slash "/roger label [[0:FLEET:0]] pi" || fail "Pi did not answer /roger label"
   wait_for 10 "own label confirmed" grep -qF "$SENDER is now [[0:FLEET:0]] pi" "$work/tool.out"
-  "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
+  "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a connected=true last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
     || fail "board does not show the label set by /roger label: $("$bin" board --socket "$work/a.sock")"
   pi_slash "/roger label $RECIPIENT Tracer" || fail "Pi did not answer /roger label <address>"
   wait_for 10 "tracer label confirmed" grep -qF "$RECIPIENT is now Tracer" "$work/tool.out"
@@ -407,7 +407,7 @@ pi_shim() {
   pi_ui input '{value:"Picked"}'
   pi_answered
   wait_for 10 "picker relabel on the Board" sh -c "'$bin' board --socket '$work/b.sock' | grep -q '^SESSION address=$RECIPIENT .* label=Picked\$'"
-  grep -qF "Recent sessions (seen within 600s) (2)" "$work/tool.out" || fail "/roger board lacks the recent heading"
+  grep -qF "Present sessions (connected or seen within 600s) (2)" "$work/tool.out" || fail "/roger board lacks the present heading"
   grep -qF "Your host: host-a" "$work/tool.out" || fail "/roger board lacks the own host"
   grep -qF "$RECIPIENT — host host-b — Tracer" "$work/tool.out" || fail "/roger board lacks the tracer row with its label"
   grep -qF "$SENDER (you) — host host-a — [[0:FLEET:0]] pi" "$work/tool.out" || fail "/roger board lacks the own row"
@@ -435,9 +435,36 @@ pi_shim() {
   pi_slash "/call-roger-board" || fail "Pi did not answer /call-roger-board"
   wait_for 10 "roger_board tool answered" grep -qF '\"label\":\"Tracer\"' "$work/tool.out"
   grep -qF '\"last_seen_ms\":' "$work/tool.out" || fail "roger_board rows lack last_seen_ms"
+  grep -qF '\"connected\":true' "$work/tool.out" || fail "roger_board rows lack connected"
   pi_stop
 
-  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label, board (recent and all, with last seen), address-prefix, label and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
+  # Presence is the open connection: with a 1 s window, the idle Tracer stays
+  # in the default /roger view long after its last act, while a session whose
+  # connection closed drops out of it and stays under /roger all.
+  local gone="44444444-4444-4444-8444-444444444444"
+  "$bin" session --socket "$work/b.sock" --id "$gone" --store "$work/gone.store" >"$work/gone.out" 2>&1 &
+  local gone_pid=$!
+  pids+=("$gone_pid")
+  wait_for 10 "short-lived session READY" grep -q READY "$work/gone.out"
+  kill "$gone_pid"
+  wait_for 10 "closed session disconnected" sh -c "'$bin' board --socket '$work/a.sock' | grep -q '^SESSION address=$gone host=host-b connected=false '"
+  ROGER_PRESENCE_WINDOW_MS=1000 pi_start idle "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  # Idle past the window: nothing on either side acts for 2 s.
+  sleep 2
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "Present sessions (connected or seen within 1s) (2)" "$work/idle.out" \
+    || fail "/roger default view lost the idle connected session"
+  grep -qF "$RECIPIENT — host host-b — Tracer — connected" "$work/idle.out" || fail "/roger lacks the idle Tracer as connected"
+  grep -qF "$gone" "$work/idle.out" && fail "/roger default view shows a session whose connection closed"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "$gone — host host-b — last seen" "$work/idle.out" || fail "/roger all lacks the disconnected session"
+  pi_stop
+
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label, board (present and all; an idle connected session stays present past the window, a closed one drops out), address-prefix, label and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
 }
 
 # Proof 4. Two hosts, one coordinator. A on decent-spider and B on agent-jail
@@ -570,10 +597,10 @@ references() {
   log_count "$body" 1 "$work/tracer.store" || fail "recipient Store must hold the body once"
 
   # Board: both hosts read both labels byte-identical. The Board read is
-  # proof 4's `roger board`, one `SESSION address=<a> host=<h> last_seen_ms=<ms> label=<l>` line
+  # proof 4's `roger board`, one `SESSION address=<a> host=<h> connected=<bool> last_seen_ms=<ms> label=<l>` line
   # per registered session; the label is the rest of the line after `label=`.
   board_label() { # board_label <socket> <address>: the label the Board shows
-    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* last_seen_ms=[0-9]* label=//p"
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* connected=[a-z]* last_seen_ms=[0-9]* label=//p"
   }
   board_host() { # board_host <socket> <address>
     "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=\([^ ]*\) .*/\1/p"

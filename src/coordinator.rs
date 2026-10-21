@@ -39,11 +39,15 @@ struct State {
     labels: HashMap<String, String>,   // session -> label, stored verbatim
     /// Opaque text each session declared at its latest Register, verbatim.
     declared: HashMap<String, String>,
-    /// Presence: when each Address last acted (register, send, ack, or a Board
-    /// read naming it), on the coordinator clock. Set at the moment of the
-    /// act and only read by the Board; memory only, since every live session
-    /// re-registers when its host daemon reconnects.
+    /// Presence: when each Address last acted (register, send, a live ack, a
+    /// Board read naming it) or disconnected, on the coordinator clock. Set at
+    /// the moment of the event and only read by the Board; memory only, since
+    /// every live session re-registers when its host daemon reconnects.
     seen: HashMap<String, i64>,
+    /// Addresses whose session connection to their host daemon is open and
+    /// whose host daemon's link here is up. Set by Register, cleared by that
+    /// daemon's disconnect report or by its link dropping.
+    connected: HashSet<String>,
     mails: HashMap<String, Mail>,
     order: Vec<String>,
     /// Broadcast ids already committed, so a resent broadcast fans out once.
@@ -75,6 +79,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         labels: HashMap::new(),
         declared: HashMap::new(),
         seen: HashMap::new(),
+        connected: HashSet::new(),
         mails: HashMap::new(),
         order: Vec::new(),
         broadcasts: HashSet::new(),
@@ -242,6 +247,13 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         st.hosts.insert(host.clone(), (id, Arc::clone(&writer)));
         id
     };
+    // However this connection ends (EOF, error, or a `?` below), the link drop
+    // is handled once, when this guard goes.
+    let _link = HostLink {
+        state: Arc::clone(&state),
+        host: host.clone(),
+        conn_id,
+    };
     net::send(&writer, &obj(vec![("type", s("hello_ok"))]))?;
     let pushes = {
         let st = state.lock().unwrap();
@@ -259,6 +271,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let pushes = {
                     let mut st = state.lock().unwrap();
                     st.seen.insert(session.clone(), now_ms());
+                    st.connected.insert(session.clone());
                     if st.sessions.get(&session).map(|h| h.as_str()) != Some(host.as_str()) {
                         let ev = obj(vec![
                             ("ev", s("session")),
@@ -357,6 +370,16 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     let _ = net::send(&w, &msg);
                 }
             }
+            // The session's connection to this host daemon closed.
+            "disconnect" => {
+                let session = net::field(&v, "session")?.to_string();
+                let mut st = state.lock().unwrap();
+                // A session that has since registered through another host
+                // is still connected there.
+                if st.sessions.get(&session) == Some(&host) && st.connected.remove(&session) {
+                    st.seen.insert(session, now_ms());
+                }
+            }
             "relabel" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let session = net::field(&v, "session")?.to_string();
@@ -379,7 +402,11 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let record = net::field(&v, "record")?.to_string();
                 let known = {
                     let mut st = state.lock().unwrap();
-                    st.seen.insert(session.clone(), now_ms());
+                    // A replayed receipt was acked earlier, while this link
+                    // was down; it is not the session's activity now.
+                    if v.get("replay") != Some(&Value::Bool(true)) {
+                        st.seen.insert(session.clone(), now_ms());
+                    }
                     match st.mails.get(&mail) {
                         None => None,
                         Some(m) => {
@@ -447,14 +474,41 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             }
         }
     }
-
-    let mut st = state.lock().unwrap();
-    // Only this connection may take the slot: a host that reconnected while
-    // this thread was finishing already owns it.
-    if st.hosts.get(&host).map(|(id, _)| *id) == Some(conn_id) {
-        st.hosts.remove(&host);
-    }
     Ok(())
+}
+
+/// One host daemon's link. When it drops, the host's slot is freed and every
+/// session on that host stops being connected, at that moment.
+struct HostLink {
+    state: Arc<Mutex<State>>,
+    host: String,
+    conn_id: u64,
+}
+
+impl Drop for HostLink {
+    fn drop(&mut self) {
+        let Ok(mut st) = self.state.lock() else {
+            return;
+        };
+        // Only this connection may take the slot: a host that reconnected
+        // while this thread was finishing already owns it, and its
+        // re-registration has already marked its live sessions connected.
+        if st.hosts.get(&self.host).map(|(id, _)| *id) != Some(self.conn_id) {
+            return;
+        }
+        st.hosts.remove(&self.host);
+        let now = now_ms();
+        let gone: Vec<String> = st
+            .sessions
+            .iter()
+            .filter(|(a, h)| **h == self.host && st.connected.contains(*a))
+            .map(|(a, _)| a.clone())
+            .collect();
+        for a in gone {
+            st.connected.remove(&a);
+            st.seen.insert(a, now);
+        }
+    }
 }
 
 fn holder_fields(pairs: &mut Vec<(&str, Value)>, holder: Option<&Held>, now: i64) {
@@ -521,10 +575,12 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     Ok(obj(pairs))
 }
 
-/// The Board: registered sessions, each with when it was last seen
-/// (`last_seen_ms`, coordinator epoch ms; 0 when not seen since this
-/// coordinator started), and every claim live at the moment of the read.
-/// Which sessions count as recently seen is the reader's choice.
+/// The Board: registered sessions and every claim live at the moment of the
+/// read. Each session row says whether it is `connected` and when it was
+/// last seen (`last_seen_ms`, coordinator epoch ms): the moment of the read
+/// while connected, else its disconnect or last own activity, 0 when not
+/// seen since this coordinator started. Which sessions count as present is
+/// the reader's choice.
 fn board(st: &State, v: &Value) -> Value {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let now = now_ms();
@@ -540,9 +596,14 @@ fn board(st: &State, v: &Value) -> Value {
                     "label",
                     s(st.labels.get(session).map(String::as_str).unwrap_or("")),
                 ),
+                ("connected", Value::Bool(st.connected.contains(session))),
                 (
                     "last_seen_ms",
-                    Value::Int(st.seen.get(session).copied().unwrap_or(0)),
+                    Value::Int(if st.connected.contains(session) {
+                        now
+                    } else {
+                        st.seen.get(session).copied().unwrap_or(0)
+                    }),
                 ),
             ];
             if let Some(d) = st.declared.get(session) {

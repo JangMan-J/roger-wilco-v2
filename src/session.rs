@@ -416,9 +416,10 @@ pub fn board(socket: PathBuf, from: Option<String>) -> io::Result<()> {
     let (sessions, claims) = (list("sessions"), list("claims"));
     for v in &sessions {
         println!(
-            "SESSION address={} host={} last_seen_ms={} label={}",
+            "SESSION address={} host={} connected={} last_seen_ms={} label={}",
             net::field(v, "session")?,
             net::field(v, "host")?,
+            v.get("connected") == Some(&Value::Bool(true)),
             v.get("last_seen_ms").and_then(|x| x.as_i64()).unwrap_or(0),
             net::field(v, "label")?
         );
