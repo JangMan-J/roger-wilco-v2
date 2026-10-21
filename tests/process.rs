@@ -24,8 +24,14 @@ impl Rig {
     fn new(tag: &str) -> Rig {
         // No PID in the name: Rig::new clears the directory, so each tag owns
         // one directory and a failing run's logs survive until the next run of
-        // that tag instead of being deleted on drop.
-        let dir = std::env::temp_dir().join(format!("roger-process-{tag}"));
+        // that tag instead of being deleted on drop. The checkout is part of
+        // the name so sibling worktrees testing at once never share one.
+        let tree = env!("CARGO_MANIFEST_DIR")
+            .bytes()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, b| {
+                (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+            });
+        let dir = std::env::temp_dir().join(format!("roger-process-{tree:016x}-{tag}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Rig {
@@ -165,6 +171,28 @@ impl Rig {
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let idx = self.spawn(&arg_refs, out);
         wait_for_text(&self.p(out), "READY", Duration::from_secs(10));
+        idx
+    }
+
+    /// Register `id` as a session on one host's daemon: a Tracer with its own
+    /// Store, kept alive so the Address stays registered.
+    fn register(&mut self, sock: &str, id: &str) -> usize {
+        let tag = &sock[..1];
+        let out = format!("session-{tag}-{}.out", &id[..4]);
+        let store = self.p(&format!("session-{tag}-{}.store", &id[..4]));
+        let idx = self.spawn(
+            &[
+                "session",
+                "--socket",
+                self.p(sock).to_str().unwrap(),
+                "--id",
+                id,
+                "--store",
+                store.to_str().unwrap(),
+            ],
+            &out,
+        );
+        wait_for_text(&self.p(&out), "READY", Duration::from_secs(10));
         idx
     }
 
@@ -913,13 +941,41 @@ fn assert_one_holder(rig: &Rig, owner: &str) {
     }
 }
 
+/// A Claim belongs to a session: an owner that never registered is refused
+/// before any decision, so it can neither hold a key nor renew one.
+#[test]
+fn claim_by_an_unregistered_owner_is_refused() {
+    let mut rig = Rig::new("claims-unregistered");
+    rig.start_stack();
+    let stranger = "99999999-9999-4999-8999-999999999999";
+    let (code, out) = claim_cmd(&rig, "a.sock", "claim", stranger, 60_000);
+    assert_eq!(code, 3, "{out}");
+    assert!(
+        out.starts_with(&format!(
+            "REFUSED op=acquire reason=\"owner {stranger} is not a registered session\" "
+        )),
+        "{out}"
+    );
+    assert!(board(&rig, "a.sock").contains("claims=0"));
+
+    // The key is held by a session; the stranger cannot renew or release it.
+    rig.register("a.sock", SENDER);
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
+    assert_eq!(claim_cmd(&rig, "b.sock", "renew", stranger, 60_000).0, 3);
+    assert_eq!(claim_cmd(&rig, "b.sock", "release", stranger, 0).0, 3);
+    assert_one_holder(&rig, SENDER);
+}
+
 #[test]
 fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
     let mut rig = Rig::new("claims");
     rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.register("b.sock", RECIPIENT);
 
-    let start = Instant::now();
     let (code, out) = claim_cmd(&rig, "a.sock", "claim", SENDER, 1500);
+    // The first deadline is measured from the grant, not from before it.
+    let granted = Instant::now();
     assert_eq!(code, 0, "{out}");
     assert!(
         out.starts_with(&format!("CLAIMED op=acquire holder={SENDER} ")),
@@ -941,7 +997,8 @@ fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
     assert!(out.starts_with("RENEWED "), "{out}");
 
     // Past the first deadline, the renewal still holds.
-    std::thread::sleep(Duration::from_millis(1700).saturating_sub(start.elapsed()));
+    std::thread::sleep(Duration::from_millis(1700).saturating_sub(granted.elapsed()));
+    assert!(granted.elapsed() >= Duration::from_millis(1500));
     assert_one_holder(&rig, SENDER);
     assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 1500).0, 3);
 
@@ -951,7 +1008,7 @@ fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
         assert!(Instant::now() < deadline, "claim never expired");
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(start.elapsed() >= Duration::from_millis(3000));
+    assert!(granted.elapsed() >= Duration::from_millis(3000));
     let (code, out) = claim_cmd(&rig, "a.sock", "renew", SENDER, 3000);
     assert_eq!(code, 3, "an expired claim cannot be renewed back: {out}");
     let (code, out) = claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000);
@@ -966,6 +1023,8 @@ fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
 fn release_is_the_holders_and_frees_the_key() {
     let mut rig = Rig::new("claims-release");
     rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.register("b.sock", RECIPIENT);
     assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
     assert_eq!(claim_cmd(&rig, "b.sock", "release", RECIPIENT, 0).0, 3);
     assert_one_holder(&rig, SENDER);
@@ -981,6 +1040,8 @@ fn release_is_the_holders_and_frees_the_key() {
 fn claim_survives_a_coordinator_restart() {
     let mut rig = Rig::new("claims-restart");
     rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.register("b.sock", RECIPIENT);
     assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
     rig.restart_coordinator();
     // Until the host daemon reconnects the request fails outright (exit 1);

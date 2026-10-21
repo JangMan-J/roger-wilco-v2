@@ -315,7 +315,11 @@ pub fn claim(
         (true, "renew") => "RENEWED",
         (true, _) => "RELEASED",
     };
-    println!("{word} op={op} {}key={key}", holder_text(&reply));
+    let reason = match net::field(&reply, "reason") {
+        Ok(r) => format!("reason={r:?} "),
+        Err(_) => String::new(),
+    };
+    println!("{word} op={op} {reason}{}key={key}", holder_text(&reply));
     Ok(ok)
 }
 

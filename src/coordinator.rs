@@ -447,6 +447,22 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
             ),
         ]));
     }
+    // A Claim is held by a session: an owner the coordinator has never seen
+    // Register is refused before any decision, so a stray string can neither
+    // hold a key nor renew one.
+    if !st.sessions.contains_key(&owner) {
+        return Ok(obj(vec![
+            ("type", s("claim_result")),
+            ("req", Value::Int(req)),
+            ("ok", Value::Bool(false)),
+            ("op", s(op.name())),
+            ("key", s(&key)),
+            (
+                "reason",
+                s(&format!("owner {owner} is not a registered session")),
+            ),
+        ]));
+    }
     let now = now_ms();
     let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
     if let Some(change) = &d.change {

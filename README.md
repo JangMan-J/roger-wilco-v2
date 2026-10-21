@@ -14,7 +14,8 @@ cargo build --release --offline
 One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
 line stream for a shim), `send`, `label`, and the claim and Board client: `claim`, `renew`,
-`release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused) and `board`
+`release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused; `--owner` must be a
+registered session Address, anything else is refused with a reason) and `board`
 (`--socket`; prints `SESSION address= host= label=`, `CLAIM holder= remaining_ms= key=`,
 `BOARD sessions= claims=`). A session may register with `--label <text>`;
 `label --socket <sock> --from <id> --label <text>` changes it. Labels are stored and

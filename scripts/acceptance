@@ -389,14 +389,36 @@ board_one_holder() {
   done
 }
 
-key_free_on_board() { ! local_roger board | grep -qF "key=$CLAIM_KEY"; }
+# key_free_on_board <local|remote>: that host's Board has no claim on the key.
+# A failed board read is a failure, not a free key.
+key_free_on_board() {
+  local out
+  out="$("${1}_roger" board)" || return 1
+  ! grep -qF "key=$CLAIM_KEY" <<<"$out"
+}
 
 claims() {
-  local a="$SENDER" b="$RECIPIENT" t0 tr
+  local a="$SENDER" b="$RECIPIENT" stray="99999999-9999-4999-8999-999999999999" t0 t1 tr
   two_host_stack
+
+  # A Claim is held by a session: register A on decent-spider and B on
+  # agent-jail before either claims. An owner nobody registered is refused.
+  "$bin" session --socket "$work/a.sock" --id "$a" --store "$work/a.store" \
+    >"$work/session-a.out" 2>&1 &
+  pids+=("$!")
+  remote_spawn session-b.pid session-b.out \
+    "./roger session --socket $remote_work/b.sock --id $b --store $remote_work/b.store" \
+    || fail "start remote session $b"
+  wait_for 10 "session $a READY" grep -q READY "$work/session-a.out"
+  wait_for 15 "session $b READY" ssh -n "$REMOTE_HOST" "grep -q READY $remote_work/session-b.out"
+  expect_claim 3 "REFUSED op=acquire reason=\"owner $stray is not a registered session\" " \
+    local claim --owner "$stray" --ttl-ms 4000
 
   t0="$(now_ms)"
   expect_claim 0 "CLAIMED op=acquire holder=$a " local claim --owner "$a" --ttl-ms 4000
+  # The first deadline is the coordinator's clock at the acquire plus 4000 ms,
+  # so it lies in [t0+4000, t1+4000]: renew before t0+4000, test past t1+4000.
+  t1="$(now_ms)"
   expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
   expect_claim 3 "REFUSED op=renew holder=$a " remote renew --owner "$b" --ttl-ms 60000
   board_one_holder "$a"
@@ -406,13 +428,15 @@ claims() {
   expect_claim 0 "RENEWED op=renew holder=$a " local renew --owner "$a" --ttl-ms 8000
 
   # Past the first deadline: the renewal holds the key.
-  sleep "$(awk -v ms=$(( t0 + 4500 - $(now_ms) )) 'BEGIN { print (ms > 0 ? ms / 1000 : 0) }')"
+  sleep "$(awk -v ms=$(( t1 + 4500 - $(now_ms) )) 'BEGIN { print (ms > 0 ? ms / 1000 : 0) }')"
+  (( $(now_ms) >= t1 + 4000 )) || fail "woke before the first deadline"
   expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
   board_one_holder "$a"
 
   # Past the renewed deadline the key is free: no release, no sweep.
-  wait_for 20 "expiry frees the key" key_free_on_board
+  wait_for 20 "expiry frees the key" key_free_on_board local
   (( $(now_ms) >= tr + 8000 )) || fail "key freed before the renewed deadline"
+  key_free_on_board remote || fail "agent-jail board still shows the key after expiry"
   grep -q '"ev":"release"' "$work/coord.log" && fail "a release event freed the key, not expiry"
   expect_claim 3 "REFUSED op=renew " local renew --owner "$a" --ttl-ms 8000
 
@@ -421,7 +445,7 @@ claims() {
   board_one_holder "$b"
 
   "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
-  echo "PASS claims: second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from decent-spider and agent-jail showed one holder"
+  echo "PASS claims: unregistered owner refused, second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from decent-spider and agent-jail showed one holder"
 }
 
 # Proof 6: references keep both integers verbatim through send, Store,
