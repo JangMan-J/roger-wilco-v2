@@ -82,7 +82,8 @@ busy Pi queues it and hands it to the model at the turn boundary. A `wake: false
 (a broadcast copy) is rendered with `triggerTurn: false`. The Store write and the Ack wait for
 neither. `scripts/acceptance wake` drives this with a scripted faux model
 (`shims/pi/test/faux-model.ts`), so it needs `pi` but makes no model call. The Claude shim
-declares nothing and does not wake.
+does not wake and declares no wake latency; `ROGER_DECLARE=<text>` passes opaque text as
+`--declare` (unset declares nothing).
 
 `scripts/acceptance cross-host` runs the coordinator on this host's tailnet
 address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
@@ -97,7 +98,7 @@ binaries, then removes every process and directory it created.
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped agent session (Tracer) and adapter; writes its Store, then acks |
-| `shims/claude/roger-mcp.mjs` | Claude Code shim: `roger_send` and `roger_inbox` MCP tools over the adapter |
+| `shims/claude/roger-mcp.mjs` | Claude Code shim: `roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_release` MCP tools over the adapter |
 | `shims/pi/roger.ts` | Pi shim: renders mail into the transcript, forwards `/roger-send` and the `roger_send` tool |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | one-object-per-line codec |
