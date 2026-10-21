@@ -50,6 +50,7 @@ fn main() -> io::Result<()> {
                 None => session::gen_uuid()?,
             },
             PathBuf::from(need(&args, "--store")?),
+            arg(&args, "--hold-before-ack").map(PathBuf::from),
         ),
         "send" => session::send(
             PathBuf::from(need(&args, "--socket")?),

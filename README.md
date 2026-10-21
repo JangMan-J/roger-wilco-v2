@@ -20,6 +20,8 @@ line stream for a shim), `send`. Shims live outside `src/`: `shims/pi/roger.ts` 
 
 ```sh
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
+scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
+node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter
 scripts/acceptance independence   # proof 2: Pi and Claude Code sessions (plus a Tracer) exchange mail; loopback
 scripts/check-harness-free        # invariant: no harness identity in the core
 ```
@@ -27,6 +29,12 @@ scripts/check-harness-free        # invariant: no harness identity in the core
 `scripts/acceptance independence` needs `pi`, `claude` (logged in) and `node`. It makes one
 real Claude Code model call (haiku); Pi needs none. Claude's tool results are read from its
 own stream-json output.
+
+Delivery to a model is best effort and separate from the core's guarantee: the adapter's Store
+is durable and acked before the shim is told, but what a shim has shown its harness is not. The
+Claude shim keeps unshown Mail in memory for `roger_inbox`; if that process dies first, the Mail
+is still in the Store and the receipt stands, and nothing replays it to the model. The Pi shim
+writes each delivery into Pi's transcript.
 
 `scripts/acceptance cross-host` runs the coordinator on this host's tailnet
 address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default

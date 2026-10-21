@@ -25,11 +25,21 @@ pub fn run(
 /// (optional `"mail"`) and is told `ready`, `accepted`, `error`, and `mail`.
 /// A `mail` line follows the Store write and never gates the ack: the shim
 /// renders what the adapter already holds and acknowledges nothing.
-pub fn adapter(socket: PathBuf, id: String, store_path: PathBuf) -> io::Result<()> {
+pub fn adapter(
+    socket: PathBuf,
+    id: String,
+    store_path: PathBuf,
+    hold_before_ack: Option<PathBuf>,
+) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
     let (sock, me, to_shim) = (socket.clone(), id.clone(), out.clone());
+    // A send blocks until the core answers, so sends run on a worker, one at a
+    // time and in order (a shim pairs replies to sends by order). The reader
+    // below only reads stdin, so the shim's EOF ends this process at once even
+    // while a send waits.
+    let (tx, rx) = std::sync::mpsc::channel::<io::Result<Value>>();
     std::thread::spawn(move || {
-        for line in net::lines(Box::new(io::stdin())) {
+        for line in rx {
             let reply = line.and_then(|v| shim_send(&sock, &me, &v));
             let _ = net::send(
                 &to_shim,
@@ -38,19 +48,31 @@ pub fn adapter(socket: PathBuf, id: String, store_path: PathBuf) -> io::Result<(
                 }),
             );
         }
+    });
+    std::thread::spawn(move || {
+        for line in net::lines(Box::new(io::stdin())) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
         // The shim's stdin closed: its harness is gone, so this session is too.
         std::process::exit(0);
     });
-    serve(socket, id, store_path, None, Some(out))
+    serve(socket, id, store_path, hold_before_ack, Some(out))
 }
 
 fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
     if net::field(v, "type")? != "send" {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected send"));
     }
-    let mail = match net::field(v, "mail") {
-        Ok(m) => m.to_string(),
-        Err(_) => gen_uuid()?,
+    // A missing mail id is generated; a present one of the wrong type is a
+    // malformed send, not a request to pick another id.
+    let mail = match v.get("mail") {
+        None => gen_uuid()?,
+        Some(m) => m
+            .as_str()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "mail must be a string"))?
+            .to_string(),
     };
     let mail = send_mail(
         socket,

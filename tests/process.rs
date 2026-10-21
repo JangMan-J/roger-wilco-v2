@@ -56,7 +56,14 @@ impl Rig {
 
     /// Start `roger adapter` on a host's daemon socket. Returns its stdin, the
     /// only way a shim speaks to it; its stdout is the file `out`.
-    fn start_adapter(&mut self, sock: &str, id: &str, store: &str, out: &str) -> ChildStdin {
+    fn start_adapter(
+        &mut self,
+        sock: &str,
+        id: &str,
+        store: &str,
+        out: &str,
+        extra: &[&str],
+    ) -> (usize, ChildStdin) {
         let child_out = fs::File::create(self.p(out)).unwrap();
         let mut child = Command::new(BIN)
             .args([
@@ -68,6 +75,7 @@ impl Rig {
                 "--store",
                 self.p(store).to_str().unwrap(),
             ])
+            .args(extra)
             .stdin(Stdio::piped())
             .stdout(Stdio::from(child_out))
             .stderr(Stdio::from(
@@ -78,7 +86,7 @@ impl Rig {
         let stdin = child.stdin.take().unwrap();
         self.children.push(child);
         wait_for_text(&self.p(out), "\"type\":\"ready\"", Duration::from_secs(10));
-        stdin
+        (self.children.len() - 1, stdin)
     }
 
     /// The coordinator argv, shared by the first start and every restart so a
@@ -569,7 +577,8 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     rig.start_stack();
     rig.start_recipient("tracer.out", false);
     let adapter_id = SENDER;
-    let mut shim_in = rig.start_adapter("a.sock", adapter_id, "adapter.store", "adapter.out");
+    let (_, mut shim_in) =
+        rig.start_adapter("a.sock", adapter_id, "adapter.store", "adapter.out", &[]);
 
     // Shim -> Tracer: the shim forwards a send tool call as one line.
     let body_out = "from the shim [[153:Meteor Shower:7]]";
@@ -629,4 +638,111 @@ fn adapter_session_and_tracer_exchange_mail_both_ways() {
     );
     let coord = read(&rig.p("coord.log"));
     assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+}
+
+#[test]
+fn adapter_rejects_a_malformed_send_and_keeps_serving() {
+    let mut rig = Rig::new("adapter-malformed");
+    rig.start_stack();
+    rig.start_recipient("tracer.out", false);
+    let (_, mut shim_in) = rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
+
+    // Not JSON, then a mail id of the wrong type: each is an error reply and
+    // neither reaches the core (a wrong-typed id must not become a fresh UUID).
+    writeln!(shim_in, "not json").unwrap();
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":5,\"body\":\"x\"}}"
+    )
+    .unwrap();
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"mail\":\"ok-1\",\"body\":\"fine\"}}"
+    )
+    .unwrap();
+    wait_for_text(
+        &rig.p("adapter.out"),
+        "\"type\":\"accepted\",\"mail\":\"ok-1\"",
+        Duration::from_secs(10),
+    );
+    let out = read(&rig.p("adapter.out"));
+    assert_eq!(count_lines_with(&out, "\"type\":\"error\""), 2, "{out}");
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"mail\""), 1, "{coord}");
+}
+
+#[test]
+fn adapter_exits_on_stdin_eof_while_a_send_waits_on_a_silent_core() {
+    let mut rig = Rig::new("adapter-eof");
+    rig.start_stack();
+    let (idx, mut shim_in) =
+        rig.start_adapter("a.sock", SENDER, "adapter.store", "adapter.out", &[]);
+    // Freeze the coordinator: its sockets stay open and it never answers, so
+    // the daemon holds the send for its full upstream wait (10 s).
+    let pid = rig.children[rig.coord_idx].id().to_string();
+    assert!(Command::new("kill")
+        .args(["-STOP", &pid])
+        .status()
+        .unwrap()
+        .success());
+    writeln!(
+        shim_in,
+        "{{\"type\":\"send\",\"to\":\"{RECIPIENT}\",\"body\":\"stuck\"}}"
+    )
+    .unwrap();
+    drop(shim_in); // the harness is gone
+
+    let start = Instant::now();
+    while rig.children[idx].try_wait().unwrap().is_none() {
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "adapter outlived its shim's stdin while a send waited"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn adapter_redelivery_after_a_kill_reports_the_same_record() {
+    let mut rig = Rig::new("adapter-redeliver");
+    rig.start_stack();
+    let hold = rig.p("held.marker");
+    let hold = hold.to_str().unwrap();
+    let (idx, _stdin) = rig.start_adapter(
+        "b.sock",
+        RECIPIENT,
+        "adapter.store",
+        "adapter1.out",
+        &["--hold-before-ack", hold],
+    );
+    rig.send("m-1", "held body");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10)); // stored, not acked
+    rig.kill(idx);
+
+    let _second = rig.start_adapter(
+        "b.sock",
+        RECIPIENT,
+        "adapter.store",
+        "adapter2.out",
+        &["--hold-before-ack", hold],
+    );
+    wait_for_text(
+        &rig.p("adapter2.out"),
+        "\"type\":\"mail\",\"mail\":\"m-1\"",
+        Duration::from_secs(10),
+    );
+    for out in ["adapter1.out", "adapter2.out"] {
+        let text = read(&rig.p(out));
+        assert!(
+            text.contains("\"body\":\"held body\",\"record\":\"r-1\""),
+            "{out}: {text}"
+        );
+    }
+    wait_for_text(
+        &rig.p("coord.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-1\"",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("adapter.store"));
+    assert_eq!(count_lines_with(&store, "held body"), 1, "{store}");
 }

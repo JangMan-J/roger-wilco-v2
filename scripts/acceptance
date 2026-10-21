@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence>
+# Usage: scripts/acceptance <cross-host|independence|pi-shim>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,7 +19,7 @@ pids=()
 
 cleanup() {
   local p
-  for p in "$coord_pid" "$daemon_pid" "${pids[@]}"; do
+  for p in "$coord_pid" "$daemon_pid" ${pids[@]+"${pids[@]}"}; do
     [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
   done
   if [[ -n "$remote_work" ]]; then
@@ -141,13 +141,14 @@ cross_host() {
 #     Claude's own stream-json output, not from the model's prose.
 # Then the Tracer, a standalone session with no harness, exchanges Mail with
 # Pi as an additional check. Loopback only.
-independence() {
-  command -v pi >/dev/null || fail "pi CLI required for the Pi session"
-  command -v claude >/dev/null || fail "claude CLI required for the Claude Code session"
-  command -v node >/dev/null || fail "node required for the Claude Code shim"
+# Loopback core shared by the checks below: build, then one coordinator and
+# two host daemons (host-a, host-b). Sets globals bin, work, coord.
+bin=""
+coord=""
+loopback_stack() {
   (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
-  local bin="$ROOT/target/release/roger"
-  local token pi_addr="$SENDER" tracer_addr="$RECIPIENT" claude_addr="$CLAUDE"
+  bin="$ROOT/target/release/roger"
+  local token h
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   trap cleanup EXIT
@@ -156,55 +157,119 @@ independence() {
     --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
   coord_pid=$!
   wait_for 10 "coordinator port file" test -s "$work/port"
-  local coord="127.0.0.1:$(cat "$work/port")" h
+  coord="127.0.0.1:$(cat "$work/port")"
   for h in a b; do
     "$bin" daemon --coordinator "$coord" --token "$token" --host-id "host-$h" \
       --socket "$work/$h.sock" --data "$work/$h.log" >"$work/daemon-$h.out" 2>&1 &
     pids+=("$!")
     wait_for 10 "daemon $h socket" test -S "$work/$h.sock"
   done
+}
 
-  "$bin" session --socket "$work/b.sock" --id "$tracer_addr" --store "$work/tracer.store" \
+start_tracer() { # the Tracer: a session with no harness, on host-b
+  "$bin" session --socket "$work/b.sock" --id "$RECIPIENT" --store "$work/tracer.store" \
     >"$work/tracer.out" 2>&1 &
   pids+=("$!")
   wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+}
 
-  # The fifo is held open read-write so Pi's stdin stays open until cleanup.
-  mkfifo "$work/pi.in"
-  exec 3<>"$work/pi.in"
-  PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$bin" ROGER_SOCKET="$work/a.sock" \
-    ROGER_SESSION="$pi_addr" ROGER_STORE="$work/pi.store" \
+# Pi in RPC mode on host-a, driven through fd 3. pi_start <tag> <address>
+# <roger-binary> <extension>; output lands in $work/<tag>.out. A stub
+# <roger-binary> stands in for the adapter only in the pi-shim failure cases.
+pi_out=""
+pi_pid=""
+pi_start() {
+  local tag="$1" addr="$2" rbin="$3" ext="$4"
+  pi_out="$work/$tag.out"
+  mkfifo "$work/$tag.in"
+  exec 3<>"$work/$tag.in" # read-write: Pi's stdin stays open until pi_stop
+  PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$rbin" ROGER_SOCKET="$work/a.sock" \
+    ROGER_SESSION="$addr" ROGER_STORE="$work/$tag.store" \
     pi --mode rpc --no-session --offline --no-extensions --no-skills --no-context-files \
-      --no-mcp -e "$ROOT/shims/pi/roger.ts" <&3 >"$work/pi.out" 2>"$work/pi.err" &
-  pids+=("$!")
-  wait_for 30 "pi accepts commands" pi_ready
+      --no-mcp -e "$ext" <&3 >"$pi_out" 2>"$work/$tag.err" &
+  pi_pid=$!
+  pids+=("$pi_pid")
+  wait_for 30 "pi accepts commands" pi_call get_state '{"type":"get_state"}'
+}
+
+pi_stop() {
+  exec 3>&-
+  kill "$pi_pid" 2>/dev/null || true
+  wait "$pi_pid" 2>/dev/null || true
+}
+
+# pi_call <id-prefix> <command-json>: send one command, succeed when Pi has
+# answered it (the response carries the unique id).
+pi_call() {
+  local id="$1-$RANDOM$RANDOM" cmd="$2"
+  printf '%s\n' "${cmd/\{/\{\"id\":\"$id\",}" >&3
+  local deadline=$(( $(date +%s) + 5 ))
+  while (( $(date +%s) < deadline )); do
+    grep -q "\"id\":\"$id\",\"type\":\"response\"" "$pi_out" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+pi_slash() { pi_call slash "$(jq -cn --arg m "$1" '{type:"prompt",message:$m}')"; }
+
+pi_transcript_has() {
+  pi_call msgs '{"type":"get_messages"}' || return 1
+  grep '"command":"get_messages"' "$pi_out" | grep -qF "$1"
+}
+
+log_count() { # log_count <fixed-string> <n> <file>: the file holds exactly n such lines
+  [[ "$(grep -cF -- "$1" "$3")" == "$2" ]]
+}
+
+# Proof 2. One coordinator, two host daemons, one client binary, one adapter
+# binary. Two actual harness sessions exchange Mail in both directions:
+#   - Pi (RPC mode; shims/pi/roger.ts) on host-a. A slash command and a
+#     delivery skip the model, so Pi needs no model call.
+#   - Claude Code (`claude -p`; shims/claude/roger-mcp.mjs) on host-b. This
+#     makes ONE REAL model call (haiku, the user's subscription): the model
+#     must call roger_inbox and roger_send. The evidence is the structure of
+#     Claude's own stream-json: the tool_result paired by tool_use_id with the
+#     roger_inbox call, and the roger_send call's input.
+# Then the Tracer, a standalone session with no harness, exchanges Mail with
+# Pi as an additional check. Loopback only.
+independence() {
+  command -v pi >/dev/null || fail "pi CLI required for the Pi session"
+  command -v claude >/dev/null || fail "claude CLI required for the Claude Code session"
+  command -v node >/dev/null || fail "node required for the Claude Code shim"
+  command -v jq >/dev/null || fail "jq required to read Claude's stream-json"
+  local pi_addr="$SENDER" tracer_addr="$RECIPIENT" claude_addr="$CLAUDE"
+  loopback_stack
+  start_tracer
+  pi_start pi "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts"
 
   local out_body="pi to tracer [[153:Meteor Shower:7]]"
   local in_body="tracer to pi [[0:FLEET:0]]"
 
   # Pi -> Tracer: a slash command the shim handles; no model runs.
-  printf '{"id":"send1","type":"prompt","message":"/roger-send %s %s"}\n' "$tracer_addr" "$out_body" >&3
+  pi_slash "/roger-send $tracer_addr $out_body" || fail "Pi did not answer /roger-send"
   wait_for 15 "tracer DELIVERED Pi's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
-  [[ "$(grep -cF "$out_body" "$work/tracer.store")" == 1 ]] || fail "tracer Store must hold Pi's body exactly once"
+  log_count "$out_body" 1 "$work/tracer.store" || fail "tracer Store must hold Pi's body exactly once"
 
   # Tracer -> Pi: the client, from the tracer's host, addressed to the Pi session.
   "$bin" send --socket "$work/b.sock" --from "$tracer_addr" --to "$pi_addr" \
     --mail indep-2 --body "$in_body" | grep -q "ACCEPTED mail=indep-2" || fail "send to Pi not accepted"
   wait_for 15 "Pi Store holds the tracer's body" grep -qF "$in_body" "$work/pi.store"
-  [[ "$(grep -cF "$in_body" "$work/pi.store")" == 1 ]] || fail "Pi Store must hold the tracer's body exactly once"
+  log_count "$in_body" 1 "$work/pi.store" || fail "Pi Store must hold the tracer's body exactly once"
   wait_for 15 "Pi transcript shows the mail" pi_transcript_has "$in_body"
-  grep -q '"type":"agent_start"' "$work/pi.out" && fail "delivery started a turn"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn"
 
   # Pi -> Claude Code: sent while Claude is not running; the Mail stays
   # pending in the core until Claude's adapter registers.
   local pi_to_claude="pi to claude [[0:FLEET:0]] 4"
   local claude_to_pi="claude to pi [[153:Meteor Shower:7]] 5"
-  printf '{"id":"send2","type":"prompt","message":"/roger-send %s %s"}\n' "$claude_addr" "$pi_to_claude" >&3
+  pi_slash "/roger-send $claude_addr $pi_to_claude" || fail "Pi did not answer /roger-send"
   wait_for 15 "coordinator accepted Pi's mail for Claude" grep -qF "$pi_to_claude" "$work/coord.log"
 
   local mcp
-  mcp="$(printf '{"mcpServers":{"roger":{"command":"node","args":["%s"],"env":{"ROGER_BIN":"%s","ROGER_SOCKET":"%s","ROGER_STORE":"%s","ROGER_SESSION":"%s"}}}}' \
-    "$ROOT/shims/claude/roger-mcp.mjs" "$bin" "$work/b.sock" "$work/claude.store" "$claude_addr")"
+  mcp="$(jq -cn --arg shim "$ROOT/shims/claude/roger-mcp.mjs" --arg bin "$bin" --arg sock "$work/b.sock" \
+    --arg store "$work/claude.store" --arg id "$claude_addr" \
+    '{mcpServers:{roger:{command:"node",args:[$shim],env:{ROGER_BIN:$bin,ROGER_SOCKET:$sock,ROGER_STORE:$store,ROGER_SESSION:$id}}}}')"
   (cd "$work" && timeout 180 claude -p \
     "Call the roger_inbox tool once. Then call the roger_send tool with to=$pi_addr and body exactly: $claude_to_pi. Do nothing else." \
     --model haiku --mcp-config "$mcp" --strict-mcp-config --tools "" \
@@ -212,40 +277,85 @@ independence() {
     --no-session-persistence --max-budget-usd 1 \
     --output-format stream-json --verbose >"$work/claude.out" 2>"$work/claude.err") \
     || fail "claude -p failed: $(tail -c 500 "$work/claude.err")"
-  # The deciding evidence is Claude's own tool_result events.
-  grep '"type":"user"' "$work/claude.out" | grep -qF "$pi_to_claude" \
-    || fail "Claude's roger_inbox result did not carry Pi's body"
-  grep '"type":"assistant"' "$work/claude.out" | grep -q 'mcp__roger__roger_send' \
-    || fail "Claude did not call roger_send"
-  [[ "$(grep -cF "$pi_to_claude" "$work/claude.store")" == 1 ]] || fail "Claude's Store must hold Pi's body exactly once"
+  jq -es --arg b "$pi_to_claude" '
+      [.[] | select(.type == "assistant") | .message.content[]?
+        | select(.type == "tool_use" and .name == "mcp__roger__roger_inbox") | .id] as $ids
+      | any(.[] | select(.type == "user") | .message.content[]?
+          | select(.type == "tool_result" and (.tool_use_id as $t | $ids | index($t)) != null
+                   and (.content | tostring | contains($b))); .)' \
+    "$work/claude.out" >/dev/null \
+    || fail "no roger_inbox tool_result carrying Pi's body in Claude's stream"
+  jq -es --arg to "$pi_addr" --arg b "$claude_to_pi" '
+      any(.[] | select(.type == "assistant") | .message.content[]?
+          | select(.type == "tool_use" and .name == "mcp__roger__roger_send"
+                   and .input.to == $to and .input.body == $b); .)' \
+    "$work/claude.out" >/dev/null \
+    || fail "Claude did not call roger_send with the expected input"
+  log_count "$pi_to_claude" 1 "$work/claude.store" || fail "Claude's Store must hold Pi's body exactly once"
   wait_for 15 "Pi Store holds Claude's body" grep -qF "$claude_to_pi" "$work/pi.store"
-  [[ "$(grep -cF "$claude_to_pi" "$work/pi.store")" == 1 ]] || fail "Pi Store must hold Claude's body exactly once"
+  log_count "$claude_to_pi" 1 "$work/pi.store" || fail "Pi Store must hold Claude's body exactly once"
   wait_for 15 "Pi transcript shows Claude's mail" pi_transcript_has "$claude_to_pi"
-  grep -q '"type":"agent_start"' "$work/pi.out" && fail "delivery started a turn in Pi"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn in Pi"
 
-  [[ "$(grep -c '"ev":"mail"' "$work/coord.log")" == 4 ]] || fail "coordinator must hold exactly four mail rows"
-  [[ "$(grep -c '"ev":"receipt"' "$work/coord.log")" == 4 ]] || fail "coordinator must hold exactly four receipts"
-  [[ "$(grep -c '"record":"r-1"' "$work/coord.log")" == 3 ]] || fail "three receipts must name a recipient's first record r-1"
-  [[ "$(grep -c '"record":"r-2"' "$work/coord.log")" == 1 ]] || fail "Pi's second record must be r-2"
+  # Receipts follow the acks; wait for the observable count, not a delay.
+  wait_for 15 "four receipts at the coordinator" log_count '"ev":"receipt"' 4 "$work/coord.log"
+  log_count '"ev":"mail"' 4 "$work/coord.log" || fail "coordinator must hold exactly four mail rows"
+  log_count '"record":"r-1"' 3 "$work/coord.log" || fail "three receipts must name a recipient's first record r-1"
+  log_count '"record":"r-2"' 1 "$work/coord.log" || fail "Pi's second record must be r-2"
 
   "$ROOT/scripts/check-harness-free" || fail "core names a harness"
   echo "PASS independence: Pi and Claude Code sessions exchanged Mail both ways (Claude via one real haiku call), and the Tracer exchanged Mail with Pi, through one coordinator, two host daemons, one client and one adapter binary; each Store holds each body once"
 }
 
-pi_ready() { # Pi answers get_state once its runtime is up
-  printf '{"id":"ready%s","type":"get_state"}\n' "$RANDOM" >&3
-  sleep 0.3
-  grep -q '"command":"get_state","success":true' "$work/pi.out"
-}
+# Pi shim lifecycle, no model and no Claude. Real Pi runtime and real shim;
+# the first two cases substitute a stub for the adapter binary only to make
+# it fail; the last two use the real adapter.
+pi_shim() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  loopback_stack
+  start_tracer
+  local ext="$ROOT/shims/pi/roger.ts"
 
-pi_transcript_has() {
-  printf '{"id":"msgs%s","type":"get_messages"}\n' "$RANDOM" >&3
-  sleep 0.3
-  grep '"command":"get_messages"' "$work/pi.out" | grep -qF "$1"
+  # A missing adapter binary: the failure is reported, the harness survives.
+  pi_start missing "$SENDER" "$work/no-such-binary" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "ENOENT reported" grep -q 'roger-send failed: .*ENOENT' "$work/missing.out"
+  pi_call alive '{"type":"get_state"}' || fail "Pi died with a missing adapter binary"
+  pi_stop
+
+  # The adapter dying while a send is pending: the send fails, not hangs.
+  printf '#!/bin/sh\nread line\nexit 3\n' >"$work/dying"
+  chmod +x "$work/dying"
+  pi_start dying "$SENDER" "$work/dying" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "exit reported for the pending send" grep -q 'roger-send failed: roger adapter exited (3)' "$work/dying.out"
+  pi_stop
+
+  # session_start recurs on new_session: still one adapter on this Store.
+  local adapters='pgrep -fc "adapter --socket '"$work"'/a.sock"'
+  pi_start recur "$SENDER" "$bin" "$ext"
+  wait_for 10 "one adapter" test "$(eval "$adapters")" = 1
+  pi_call new1 '{"type":"new_session"}' || fail "new_session unanswered"
+  pi_call new2 '{"type":"new_session"}' || fail "new_session unanswered"
+  [[ "$(eval "$adapters")" == 1 ]] || fail "session_start left more than one adapter on the Store"
+  pi_stop
+  wait_for 10 "adapter exits with Pi" test "$(eval "$adapters")" = 0
+
+  # The model-facing roger_send tool's callback, invoked directly in the
+  # real Pi runtime (no model call), reaches the Tracer.
+  pi_start tool "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  pi_slash "/call-roger-send $RECIPIENT tool body [[153:Meteor Shower:7]]" || fail "Pi did not answer /call-roger-send"
+  wait_for 15 "tracer received the tool's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
+  log_count "tool body [[153:Meteor Shower:7]]" 1 "$work/tracer.store" || fail "tracer Store must hold the tool's body once"
+  pi_stop
+
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered"
 }
 
 case "${1:-}" in
   cross-host) cross_host ;;
   independence) independence ;;
-  *) echo "usage: $0 <cross-host|independence>" >&2; exit 2 ;;
+  pi-shim) pi_shim ;;
+  *) echo "usage: $0 <cross-host|independence|pi-shim>" >&2; exit 2 ;;
 esac
