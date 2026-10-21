@@ -190,6 +190,7 @@ impl Drop for Rig {
             let _ = c.kill();
             let _ = c.wait();
         }
+        let _ = fs::remove_dir_all(&self.dir);
     }
 }
 
