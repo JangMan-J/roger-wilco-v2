@@ -30,11 +30,13 @@ scripts/check-harness-free        # invariant: no harness identity in the core
 real Claude Code model call (haiku); Pi needs none. Claude's tool results are read from its
 own stream-json output.
 
-Delivery to a model is best effort and separate from the core's guarantee: the adapter's Store
-is durable and acked before the shim is told, but what a shim has shown its harness is not. The
-Claude shim keeps unshown Mail in memory for `roger_inbox`; if that process dies first, the Mail
-is still in the Store and the receipt stands, and nothing replays it to the model. The Pi shim
-writes each delivery into Pi's transcript.
+Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
+the Mail to its Store (durable), then tells the shim, then sends the Ack; the Ack stays the
+adapter's responsibility and a shim never sends it. What a shim has shown its harness is not
+durable. The Claude shim keeps unshown Mail in memory for `roger_inbox`. If it dies, the Mail is
+still in the Store. If the adapter died before its Ack, the core redelivers and the Store reuses
+the same record, so a restarted shim is told again; Mail already acked is not replayed to a model.
+The Pi shim writes each delivery into Pi's transcript.
 
 `scripts/acceptance cross-host` runs the coordinator on this host's tailnet
 address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
