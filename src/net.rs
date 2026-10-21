@@ -37,6 +37,14 @@ pub fn wake_of(v: &Value) -> bool {
     !matches!(v.get("wake"), Some(Value::Bool(false)))
 }
 
+/// A Register's declared text: opaque text a session states about itself,
+/// stored and returned verbatim and never read by the core.
+pub fn declared_of(v: &Value) -> Option<String> {
+    v.get("declared")
+        .and_then(|x| x.as_str())
+        .map(str::to_string)
+}
+
 pub fn writer(w: Box<dyn Write + Send>) -> Writer {
     Arc::new(Mutex::new(w))
 }

@@ -24,7 +24,9 @@ that moment, one Mail per recipient with id `<mail>/<address>`, each delivered a
 like directed mail; a Mail id containing `/` is refused, so no directed id can equal a
 copy id. Every delivery carries `wake`: true for directed mail, false for a
 broadcast copy; the Tracer prints it on its `STORED` line and the adapter passes it to the
-shim. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
+shim. `session` and `adapter` take `--declare <text>`: opaque text the session states about
+itself at Register, stored by the core and returned verbatim; `board` prints it as a
+`DECLARED address= declared=` line after that session's `SESSION` line. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
 ## Checks
@@ -37,6 +39,7 @@ scripts/check                     # the gate
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance broadcast     # proof 3: one broadcast reaches every registered session once, no wake
 scripts/acceptance claims        # proof 4: claims are exclusive, renew, expire; board on both hosts
+scripts/acceptance wake           # proof 5: directed mail wakes an idle Pi session; busy queues to the turn boundary
 scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
 node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter
 scripts/acceptance independence   # proof 2: Pi and Claude Code sessions (plus a Tracer) exchange mail; loopback
@@ -58,6 +61,16 @@ durable. The Claude shim keeps unshown Mail in memory for `roger_inbox`. If it d
 still in the Store. If the adapter died before its Ack, the core redelivers and the Store reuses
 the same record, so a restarted shim is told again; Mail already acked is not replayed to a model.
 The Pi shim writes each delivery into Pi's transcript.
+
+Wake is the shim's job; the core carries no busy or idle state. The Pi shim declares
+`wake-latency-ms=<n>` through `--declare` (`ROGER_WAKE_LATENCY_MS`, default 1000; `off` declares
+nothing and never wakes). A delivery with `wake: true` goes to Pi as
+`sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })`: an idle Pi starts a turn, a
+busy Pi queues it and hands it to the model at the turn boundary. A `wake: false` delivery
+(a broadcast copy) is rendered with `triggerTurn: false`. The Store write and the Ack wait for
+neither. `scripts/acceptance wake` drives this with a scripted faux model
+(`shims/pi/test/faux-model.ts`), so it needs `pi` but makes no model call. The Claude shim
+declares nothing and does not wake.
 
 `scripts/acceptance cross-host` runs the coordinator on this host's tailnet
 address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
