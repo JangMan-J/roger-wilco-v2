@@ -5,8 +5,6 @@ agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
 session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
 ---
 
-> Draft fork of roger-wilco-rebuild. Not promoted; not frozen.
-
 # Roger-Wilco invariants
 
 These are the anti-goals of Roger-Wilco: what it will never be, serve, enter, or contain, and the invariants no work in it may violate.
