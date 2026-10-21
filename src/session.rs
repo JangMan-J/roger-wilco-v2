@@ -243,8 +243,18 @@ fn send_mail(socket: &PathBuf, from: &str, to: &str, mail: &str, body: &str) -> 
     )?;
     for line in &mut lines {
         let v = line?;
-        if net::field(&v, "type")? == "accepted" {
-            return Ok(net::field(&v, "mail")?.to_string());
+        match net::field(&v, "type")? {
+            "accepted" => return Ok(net::field(&v, "mail")?.to_string()),
+            "error" => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "send of {mail} refused: {}",
+                        net::field(&v, "reason").unwrap_or("unexplained")
+                    ),
+                ))
+            }
+            _ => {}
         }
     }
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))

@@ -21,7 +21,8 @@ line stream for a shim), `send`, `label`, and the claim and Board client: `claim
 returned verbatim and never change an Address or its mailbox. `send --to '*'` is a
 Broadcast: the coordinator commits it once and fans it out to every session registered at
 that moment, one Mail per recipient with id `<mail>/<address>`, each delivered and acked
-like directed mail. Every delivery carries `wake`: true for directed mail, false for a
+like directed mail; a Mail id containing `/` is refused, so no directed id can equal a
+copy id. Every delivery carries `wake`: true for directed mail, false for a
 broadcast copy; the Tracer prints it on its `STORED` line and the adapter passes it to the
 shim. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).

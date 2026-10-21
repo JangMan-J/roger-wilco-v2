@@ -27,6 +27,12 @@ struct Mail {
 /// The Address a send names to reach every registered session at once.
 pub const BROADCAST: &str = "*";
 
+/// Joins a Broadcast id to a recipient Address in that recipient's copy id.
+/// No accepted Mail id may contain it, so a client-chosen id can never equal
+/// a copy id, and two copy ids are equal only for the same broadcast and
+/// recipient.
+const COPY_SEP: char = '/';
+
 struct State {
     log: DurLog,
     sessions: HashMap<String, String>, // session -> host
@@ -251,6 +257,21 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             "send" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let mail = net::field(&v, "mail")?.to_string();
+                if mail.contains(COPY_SEP) {
+                    net::send(
+                        &writer,
+                        &obj(vec![
+                            ("type", s("error")),
+                            ("req", Value::Int(req)),
+                            ("mail", s(&mail)),
+                            (
+                                "reason",
+                                s(&format!("mail id must not contain '{COPY_SEP}'")),
+                            ),
+                        ]),
+                    )?;
+                    continue;
+                }
                 let mut push: Vec<(Writer, Value)> = Vec::new();
                 {
                     let mut st = state.lock().unwrap();
@@ -497,7 +518,7 @@ fn board(st: &State, v: &Value) -> Value {
 /// The Mail id of one Broadcast copy: the broadcast's id and the recipient's
 /// Address, so each recipient's copy is delivered, stored, and acked once.
 fn copy_id(mail: &str, to: &str) -> String {
-    format!("{mail}/{to}")
+    format!("{mail}{COPY_SEP}{to}")
 }
 
 /// Expand a committed Broadcast into one Mail per recipient, carrying no wake

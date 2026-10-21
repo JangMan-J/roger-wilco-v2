@@ -408,14 +408,20 @@ fn local_loop(
                         ("body", s(net::field(&v, "body")?)),
                     ]),
                 )?;
-                net::send(
-                    writer,
-                    &obj(vec![
+                let answer = if net::field(&resp, "type")? == "error" {
+                    obj(vec![
+                        ("type", s("error")),
+                        ("req", Value::Int(req)),
+                        ("reason", s(net::field(&resp, "reason")?)),
+                    ])
+                } else {
+                    obj(vec![
                         ("type", s("accepted")),
                         ("req", Value::Int(req)),
                         ("mail", s(net::field(&resp, "mail")?)),
-                    ]),
-                )?;
+                    ])
+                };
+                net::send(writer, &answer)?;
             }
             "relabel" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);

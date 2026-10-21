@@ -1123,3 +1123,45 @@ fn directed_mail_requests_a_wake() {
         Duration::from_secs(10),
     );
 }
+
+#[test]
+fn a_directed_mail_id_can_never_equal_a_broadcast_copy_id() {
+    let mut rig = Rig::new("copy-id");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 1);
+
+    // The id a broadcast `b-1` gives the recipient's copy, sent as directed
+    // mail first: refused, so the broadcast's copy is still delivered.
+    let copy = format!("b-1/{RECIPIENT}");
+    let output = Command::new(BIN)
+        .args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--from", SENDER, "--to", RECIPIENT, "--mail", &copy])
+        .args(["--body", "impostor"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("must not contain '/'"),
+        "{output:?}"
+    );
+
+    let output = Command::new(BIN)
+        .args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args([
+            "--from", SENDER, "--to", "*", "--mail", "b-1", "--body", "real",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        &format!("DELIVERED mail={copy} record=r-1"),
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 1, "{store}");
+    assert_eq!(count_lines_with(&store, "\"body\":\"real\""), 1, "{store}");
+    let coord = read(&rig.p("coord.log"));
+    assert!(!coord.contains("impostor"), "{coord}");
+}
