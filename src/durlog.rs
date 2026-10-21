@@ -23,16 +23,22 @@ impl DurLog {
         if existed {
             File::open(path)?.read_to_end(&mut bytes)?;
         }
-        let text = String::from_utf8_lossy(&bytes);
-        let complete = if text.ends_with('\n') || text.is_empty() {
-            text.as_ref()
-        } else {
-            match text.rfind('\n') {
-                Some(i) => &text.as_ref()[..=i],
-                None => "",
-            }
+        // A crash mid-append leaves a fragment with no terminating newline.
+        // Drop it from the file, not just from the replay: an append in
+        // append mode would otherwise glue onto it and corrupt a record.
+        let keep = match bytes.iter().rposition(|&b| b == b'\n') {
+            Some(i) => i + 1,
+            None => 0,
         };
-        let lines: Vec<String> = complete
+        if keep < bytes.len() {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(path)?
+                .set_len(keep as u64)?;
+            bytes.truncate(keep);
+        }
+        let text = String::from_utf8_lossy(&bytes);
+        let lines: Vec<String> = text
             .lines()
             .filter(|l| !l.is_empty())
             .map(|l| l.to_string())
@@ -100,5 +106,26 @@ mod tests {
         let (_log, lines) = DurLog::open(&path).unwrap();
         assert_eq!(lines, vec!["{\"a\":1}".to_string()]);
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn append_after_a_crash_fragment_does_not_glue_onto_it() {
+        let path = temp_path("glue");
+        {
+            let mut f = File::create(&path).unwrap();
+            f.write_all(b"{\"a\":1}\n{\"b\":2").unwrap(); // crash mid-append
+        }
+        {
+            let (mut log, _) = DurLog::open(&path).unwrap();
+            log.append("{\"c\":3}").unwrap();
+        }
+        let (_log, lines) = DurLog::open(&path).unwrap();
+        let raw = fs::read_to_string(&path).unwrap();
+        let _ = fs::remove_file(&path);
+        assert_eq!(
+            lines,
+            vec!["{\"a\":1}".to_string(), "{\"c\":3}".to_string()],
+            "raw file: {raw:?}"
+        );
     }
 }

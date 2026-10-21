@@ -15,6 +15,7 @@ const RECIPIENT: &str = "22222222-2222-4222-8222-222222222222";
 struct Rig {
     dir: PathBuf,
     children: Vec<Child>,
+    coord_port: String,
 }
 
 impl Rig {
@@ -25,6 +26,7 @@ impl Rig {
         Rig {
             dir,
             children: Vec::new(),
+            coord_port: String::new(),
         }
     }
 
@@ -64,6 +66,7 @@ impl Rig {
         );
         wait_for_file(&port_file, Duration::from_secs(10));
         let port = fs::read_to_string(&port_file).unwrap().trim().to_string();
+        self.coord_port = port.clone();
         let coord = format!("127.0.0.1:{port}");
         for (host, sock, data, out) in [
             ("host-a", "a.sock", "a.log", "daemon-a.out"),
@@ -139,6 +142,46 @@ impl Rig {
         self.children[idx].kill().unwrap(); // SIGKILL on Unix
         self.children[idx].wait().unwrap();
     }
+
+    /// Restart the coordinator on the same port, replaying the same data
+    /// file, so the host daemon's retry finds it again.
+    fn restart_coordinator(&mut self) {
+        self.kill(0);
+        let bind = format!("127.0.0.1:{}", self.coord_port);
+        let port_file = self.p("coord2.port");
+        let start = Instant::now();
+        loop {
+            let _ = fs::remove_file(&port_file);
+            let args: Vec<String> = vec![
+                "coordinator".into(),
+                "--bind".into(),
+                bind.clone(),
+                "--port-file".into(),
+                port_file.to_str().unwrap().into(),
+                "--data".into(),
+                self.p("coord.log").to_str().unwrap().into(),
+                "--token".into(),
+                TOKEN.into(),
+            ];
+            let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let idx = self.spawn(&arg_refs, "coord2.out");
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            while Instant::now() < deadline {
+                if port_file.exists() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            // The port may still be held by the process we just killed.
+            self.kill(idx);
+            if start.elapsed() > Duration::from_secs(15) {
+                panic!(
+                    "coordinator never rebound {bind}: {}",
+                    read(&self.p("coord2.out.err"))
+                );
+            }
+        }
+    }
 }
 
 impl Drop for Rig {
@@ -186,6 +229,51 @@ fn wait_for_text(path: &Path, needle: &str, timeout: Duration) {
 
 fn count_lines_with(text: &str, needle: &str) -> usize {
     text.lines().filter(|l| l.contains(needle)).count()
+}
+
+#[test]
+fn receipt_reaches_the_coordinator_after_it_returns() {
+    let mut rig = Rig::new("receipt-late");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+
+    rig.send("m-late", "acked while the coordinator is down");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+
+    // Coordinator down: the ack can only be committed locally.
+    rig.kill(0);
+    rig.kill(recipient);
+    rig.start_recipient("recipient2.out", true);
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        "upstream",
+        Duration::from_secs(10),
+    );
+
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"receipt\""),
+        0,
+        "no receipt can exist while the coordinator is down: {coord}"
+    );
+
+    rig.restart_coordinator();
+    let start = Instant::now();
+    loop {
+        let coord = read(&rig.p("coord.log"));
+        if count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-late\"") == 1 {
+            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+            return;
+        }
+        assert!(
+            count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-late\"") <= 1,
+            "receipt duplicated: {coord}"
+        );
+        if start.elapsed() > Duration::from_secs(15) {
+            panic!("locally committed receipt never reached the coordinator: {coord}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]

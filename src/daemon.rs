@@ -29,6 +29,11 @@ struct State {
     inbox: HashMap<String, Mail>,
     order: Vec<String>,
     acked: HashSet<String>,
+    /// Receipts committed locally, in commit order: (mail, session, record).
+    /// Replayed upstream after every reconnect, because the coordinator's
+    /// ack handler is idempotent and a locally committed receipt that never
+    /// arrives upstream would leave the mail pending forever.
+    receipts: Vec<(String, String, String)>,
     sessions: HashMap<String, Writer>,
     upstream: Option<Writer>,
     next_req: i64,
@@ -50,6 +55,7 @@ pub fn run(cfg: Config) -> io::Result<()> {
         inbox: HashMap::new(),
         order: Vec::new(),
         acked: HashSet::new(),
+        receipts: Vec::new(),
         sessions: HashMap::new(),
         upstream: None,
         next_req: 1,
@@ -107,8 +113,18 @@ fn apply(state: &mut State, v: &Value) {
             }
         }
         Some("receipt") => {
-            if let Ok(mail) = net::field(v, "mail") {
-                state.acked.insert(mail.to_string());
+            if let (Ok(mail), Ok(session), Ok(record)) = (
+                net::field(v, "mail"),
+                net::field(v, "session"),
+                net::field(v, "record"),
+            ) {
+                if state.acked.insert(mail.to_string()) {
+                    state.receipts.push((
+                        mail.to_string(),
+                        session.to_string(),
+                        record.to_string(),
+                    ));
+                }
             }
         }
         _ => {}
@@ -163,15 +179,27 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
             "hello refused",
         ));
     }
-    let known: Vec<String> = {
+    let (known, receipts): (Vec<String>, Vec<(String, String, String)>) = {
         let mut st = state.lock().unwrap();
         st.upstream = Some(Arc::clone(&writer));
-        st.sessions.keys().cloned().collect()
+        (st.sessions.keys().cloned().collect(), st.receipts.clone())
     };
     for session in known {
         let _ = net::send(
             &writer,
             &obj(vec![("type", s("register")), ("session", s(&session))]),
+        );
+    }
+    // A receipt committed while upstream was down still has to arrive.
+    for (mail, session, record) in receipts {
+        let _ = net::send(
+            &writer,
+            &obj(vec![
+                ("type", s("ack")),
+                ("mail", s(&mail)),
+                ("session", s(&session)),
+                ("record", s(&record)),
+            ]),
         );
     }
     for line in lines {
@@ -310,7 +338,7 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
                 let record = net::field(&v, "record")?.to_string();
                 {
                     let mut st = state.lock().unwrap();
-                    if !st.acked.contains(&mail) {
+                    if st.acked.insert(mail.clone()) {
                         let ev = obj(vec![
                             ("ev", s("receipt")),
                             ("mail", s(&mail)),
@@ -318,7 +346,8 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
                             ("record", s(&record)),
                         ]);
                         st.log.append(&json::stringify(&ev))?;
-                        st.acked.insert(mail.clone());
+                        st.receipts
+                            .push((mail.clone(), session.clone(), record.clone()));
                     }
                 }
                 upstream_request(
