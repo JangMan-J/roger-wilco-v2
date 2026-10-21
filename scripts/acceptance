@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims>
+# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims|references>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -150,13 +150,14 @@ cross_host() {
 # Then the Tracer, a standalone session with no harness, exchanges Mail with
 # Pi as an additional check. Loopback only.
 # Loopback core shared by the checks below: build, then one coordinator and
-# two host daemons (host-a, host-b). Sets globals bin, work, coord.
+# two host daemons (host-a, host-b). Sets globals bin, work, coord, token.
 bin=""
 coord=""
+token=""
 loopback_stack() {
   (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
   bin="$ROOT/target/release/roger"
-  local token h
+  local h
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   trap cleanup EXIT
@@ -423,10 +424,102 @@ claims() {
   echo "PASS claims: second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from decent-spider and agent-jail showed one holder"
 }
 
+# Proof 6: references keep both integers verbatim through send, Store,
+# delivery, and Board; a label change moves a session's display and never its
+# Address or mailbox. Invariant 3: no code in src branches on those integers.
+references() {
+  local meteor='[[153:Meteor Shower:7]]' fleet='[[0:FLEET:0]]'
+  local body="start $meteor then $fleet"
+  local sender_label="$fleet" recipient_label="$meteor" new_label="$fleet relabeled"
+
+  # Invariant 3 source search: nothing in src parses a Reference or inspects a
+  # label beyond carrying it. The patterns are the ways code would read an
+  # integer out of either. Unit-test modules (`#[cfg(test)]` to end of file)
+  # are fixtures, not core, and are skipped.
+  local hits f
+  hits="$(for f in "$ROOT"/src/*.rs; do
+    awk -v f="${f#"$ROOT"/}" '/^#\[cfg\(test\)\]/{exit} {print f":"NR":"$0}' "$f"
+  done | grep -E '\[\[|\blabel\b[^;]*\b(parse|split|cmp|starts_with|strip_prefix|find|trim|chars|bytes|len)\b|\blabel\b[^;]*[=!<>]=' || true)"
+  [[ -z "$hits" ]] || fail "src inspects a Reference or label:"$'\n'"$hits"
+
+  loopback_stack
+  # Sender on host-a, recipient on host-b, each registered with a label.
+  "$bin" session --socket "$work/a.sock" --id "$SENDER" --label "$sender_label" \
+    --store "$work/sender.store" >"$work/sender.out" 2>&1 &
+  pids+=("$!")
+  "$bin" session --socket "$work/b.sock" --id "$RECIPIENT" --label "$recipient_label" \
+    --store "$work/tracer.store" >"$work/tracer.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "sender READY" grep -q READY "$work/sender.out"
+  wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+
+  # Send: the body returns from the coordinator's log byte-identical.
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail ref-1 --body "$body" >"$work/send.out" || fail "send refused"
+  wait_for 10 "ref-1 delivered" grep -q 'DELIVERED mail=ref-1' "$work/tracer.out"
+  jq -e --arg b "$body" 'select(.ev == "mail" and .mail == "ref-1") | .body == $b' \
+    "$work/coord.log" >/dev/null || fail "coordinator log body differs from what was sent"
+  # Delivery: the host-b daemon's inbox holds the same bytes.
+  jq -e --arg b "$body" 'select(.ev == "deliver" and .mail == "ref-1") | .body == $b' \
+    "$work/b.log" >/dev/null || fail "host daemon delivery body differs"
+  # Store: the recipient's record holds the same bytes, once.
+  [[ "$(jq -r 'select(.mail == "ref-1") | .body' "$work/tracer.store")" == "$body" ]] \
+    || fail "recipient Store body differs: $(cat "$work/tracer.store")"
+  log_count "$body" 1 "$work/tracer.store" || fail "recipient Store must hold the body once"
+
+  # Board: both hosts read both labels byte-identical. The Board read is
+  # proof 4's `roger board`, one `SESSION address=<a> host=<h> label=<l>` line
+  # per registered session; the label is the rest of the line after `label=`.
+  board_label() { # board_label <socket> <address>: the label the Board shows
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* label=//p"
+  }
+  board_host() { # board_host <socket> <address>
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=\([^ ]*\) .*/\1/p"
+  }
+  local h label
+  for h in a b; do
+    "$bin" board --socket "$work/$h.sock" >"$work/board-$h.out" || fail "board read via host-$h"
+    label="$(board_label "$work/$h.sock" "$SENDER")"
+    [[ "$label" == "$sender_label" ]] || fail "board via host-$h shows sender label '$label'"
+    label="$(board_label "$work/$h.sock" "$RECIPIENT")"
+    [[ "$label" == "$recipient_label" ]] || fail "board via host-$h shows recipient label '$label'"
+    [[ "$(board_host "$work/$h.sock" "$RECIPIENT")" == host-b ]] \
+      || fail "board via host-$h places the recipient on the wrong host"
+  done
+
+  # Relabel the recipient from the other host: display changes, Address and
+  # mailbox do not.
+  "$bin" label --socket "$work/a.sock" --from "$RECIPIENT" --label "$new_label" \
+    >"$work/relabel.out" || fail "relabel refused"
+  label="$(board_label "$work/b.sock" "$RECIPIENT")"
+  [[ "$label" == "$new_label" ]] || fail "board after relabel shows '$label'"
+  [[ "$("$bin" board --socket "$work/b.sock" | grep -c "^SESSION address=$RECIPIENT ")" == 1 ]] \
+    || fail "relabel changed the number of Board rows for the Address"
+  [[ "$(board_host "$work/b.sock" "$RECIPIENT")" == host-b ]] || fail "relabel moved the recipient's host"
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail ref-2 --body "after relabel $meteor" >>"$work/send.out" || fail "send after relabel refused"
+  wait_for 10 "ref-2 delivered" grep -q 'DELIVERED mail=ref-2' "$work/tracer.out"
+  log_count "after relabel $meteor" 1 "$work/tracer.store" \
+    || fail "mail to the same Address after relabel must land in the same Store"
+  [[ "$(wc -l <"$work/tracer.store")" == 2 ]] || fail "recipient Store should hold exactly two records"
+
+  # The label survives a coordinator restart with the same bytes.
+  kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
+  "$bin" coordinator --bind "$coord" --data "$work/coord.log" --token "$token" \
+    >"$work/coord2.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "board after coordinator restart" "$bin" board --socket "$work/b.sock"
+  label="$(board_label "$work/b.sock" "$RECIPIENT")"
+  [[ "$label" == "$new_label" ]] || fail "board after coordinator restart shows '$label'"
+
+  echo "PASS references: $meteor and $fleet returned byte-identical through send, Store, delivery, and Board; relabel changed display only, same Address, same Store, across a coordinator restart; src inspects no Reference"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
   independence) independence ;;
   pi-shim) pi_shim ;;
   claims) claims ;;
-  *) echo "usage: $0 <cross-host|independence|pi-shim|claims>" >&2; exit 2 ;;
+  references) references ;;
+  *) echo "usage: $0 <cross-host|independence|pi-shim|claims|references>" >&2; exit 2 ;;
 esac

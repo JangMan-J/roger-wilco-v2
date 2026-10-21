@@ -139,6 +139,12 @@ impl Rig {
     }
 
     fn start_recipient(&mut self, out: &str, hold: bool) -> usize {
+        self.start_recipient_with(out, hold, None)
+    }
+
+    /// Start the recipient session on host-b, announcing `label` verbatim
+    /// at Register when one is given.
+    fn start_recipient_with(&mut self, out: &str, hold: bool, label: Option<&str>) -> usize {
         let mut args: Vec<String> = vec![
             "session".to_string(),
             "--socket".to_string(),
@@ -151,6 +157,10 @@ impl Rig {
         if hold {
             args.push("--hold-before-ack".to_string());
             args.push(self.p("held.marker").to_str().unwrap().to_string());
+        }
+        if let Some(label) = label {
+            args.push("--label".to_string());
+            args.push(label.to_string());
         }
         let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
         let idx = self.spawn(&arg_refs, out);
@@ -528,6 +538,114 @@ fn mail_survives_recipient_kill_between_store_and_ack() {
     assert!(
         coord.contains("\"record\":\"r-1\""),
         "receipt names the Store record: {coord}"
+    );
+}
+
+#[test]
+fn references_keep_both_integers_and_relabel_keeps_the_address() {
+    let mut rig = Rig::new("references");
+    rig.start_stack();
+    rig.start_recipient_with("recipient.out", false, Some("[[153:Meteor Shower:7]]"));
+
+    // Send, store, delivery: both integers come back byte-identical.
+    let body = "start [[153:Meteor Shower:7]] then [[0:FLEET:0]]";
+    rig.send("m-ref-1", body);
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-ref-1",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 1, "{store}");
+    assert_eq!(
+        count_lines_with(&store, &format!("\"body\":\"{body}\"}}")),
+        1,
+        "body field verbatim: {store}"
+    );
+
+    // Relabel from the other host: the display changes, the Address does not.
+    let new_label = "[[0:FLEET:0]] relabeled";
+    let relabeled = Command::new(BIN)
+        .args([
+            "label",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--from",
+            RECIPIENT,
+            "--label",
+            new_label,
+        ])
+        .output()
+        .unwrap();
+    let relabeled_out = String::from_utf8_lossy(&relabeled.stdout).to_string();
+    assert!(
+        relabeled.status.success(),
+        "label failed: {relabeled_out} {}",
+        String::from_utf8_lossy(&relabeled.stderr)
+    );
+    assert!(
+        relabeled_out.contains(&format!("\"label\":\"{new_label}\"")),
+        "new label verbatim: {relabeled_out}"
+    );
+
+    // The same Address still owns the same mailbox.
+    rig.send("m-ref-2", "after the relabel [[153:Meteor Shower:7]]");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-ref-2",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 2, "{store}");
+    assert_eq!(
+        count_lines_with(&store, "\"mail\":\"m-ref-2\""),
+        1,
+        "{store}"
+    );
+
+    // And after the coordinator replays its log, mail still lands there.
+    rig.restart_coordinator();
+    // The daemon reconnects on its own schedule; a send before that is
+    // refused with "no upstream", so retry until one is accepted.
+    let start = Instant::now();
+    loop {
+        let sent = Command::new(BIN)
+            .args([
+                "send",
+                "--socket",
+                rig.p("a.sock").to_str().unwrap(),
+                "--from",
+                SENDER,
+                "--to",
+                RECIPIENT,
+                "--mail",
+                "m-ref-3",
+                "--body",
+                "after the restart [[0:FLEET:0]]",
+            ])
+            .output()
+            .unwrap();
+        if sent.status.success() {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(15),
+            "send never accepted after the coordinator restart: {}",
+            String::from_utf8_lossy(&sent.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-ref-3",
+        Duration::from_secs(10),
+    );
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 3, "{store}");
+    assert_eq!(
+        count_lines_with(&store, "\"mail\":\"m-ref-3\""),
+        1,
+        "{store}"
     );
 }
 

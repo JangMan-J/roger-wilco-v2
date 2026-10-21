@@ -25,6 +25,7 @@ struct Mail {
 struct State {
     log: DurLog,
     sessions: HashMap<String, String>, // session -> host
+    labels: HashMap<String, String>,   // session -> label, stored verbatim
     mails: HashMap<String, Mail>,
     order: Vec<String>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
@@ -46,6 +47,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
     let mut state = State {
         log,
         sessions: HashMap::new(),
+        labels: HashMap::new(),
         mails: HashMap::new(),
         order: Vec::new(),
         hosts: HashMap::new(),
@@ -83,6 +85,11 @@ fn apply(state: &mut State, v: &Value) {
         Some("session") => {
             if let (Ok(session), Ok(host)) = (net::field(v, "session"), net::field(v, "host")) {
                 state.sessions.insert(session.to_string(), host.to_string());
+            }
+        }
+        Some("label") => {
+            if let (Ok(session), Ok(label)) = (net::field(v, "session"), net::field(v, "label")) {
+                state.labels.insert(session.to_string(), label.to_string());
             }
         }
         Some("mail") => {
@@ -131,6 +138,19 @@ fn apply(state: &mut State, v: &Value) {
         }
         _ => {}
     }
+}
+
+/// Record a session's label verbatim. The label is display only: it never
+/// touches the session's Address, host, or pending mail.
+fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
+    let ev = obj(vec![
+        ("ev", s("label")),
+        ("session", s(session)),
+        ("label", s(label)),
+    ]);
+    state.log.append(&json::stringify(&ev))?;
+    state.labels.insert(session.to_string(), label.to_string());
+    Ok(())
 }
 
 /// Pending deliveries for sessions on `host`, or for one session.
@@ -196,6 +216,9 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         st.log.append(&json::stringify(&ev))?;
                         st.sessions.insert(session.clone(), host.clone());
                     }
+                    if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
+                        set_label(&mut st, &session, label)?;
+                    }
                     pending_pushes(&st, &host, Some(&session))
                 };
                 for p in pushes {
@@ -246,6 +269,21 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 if let Some((w, msg)) = push {
                     let _ = net::send(&w, &msg);
                 }
+            }
+            "relabel" => {
+                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let session = net::field(&v, "session")?.to_string();
+                let label = net::field(&v, "label")?.to_string();
+                set_label(&mut state.lock().unwrap(), &session, &label)?;
+                net::send(
+                    &writer,
+                    &obj(vec![
+                        ("type", s("relabeled")),
+                        ("req", Value::Int(req)),
+                        ("session", s(&session)),
+                        ("label", s(&label)),
+                    ]),
+                )?;
             }
             "ack" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
@@ -396,7 +434,16 @@ fn board(st: &State, v: &Value) -> Value {
     sessions.sort();
     let sessions = sessions
         .into_iter()
-        .map(|(session, host)| obj(vec![("session", s(session)), ("host", s(host))]))
+        .map(|(session, host)| {
+            obj(vec![
+                ("session", s(session)),
+                ("host", s(host)),
+                (
+                    "label",
+                    s(st.labels.get(session).map(String::as_str).unwrap_or("")),
+                ),
+            ])
+        })
         .collect();
     let claims = st
         .claims

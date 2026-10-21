@@ -13,10 +13,12 @@ cargo build --release --offline
 
 One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
-line stream for a shim), `send`, and the claim and Board client: `claim`, `renew`,
+line stream for a shim), `send`, `label`, and the claim and Board client: `claim`, `renew`,
 `release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused) and `board`
-(`--socket`; prints `SESSION address= host=`, `CLAIM holder= remaining_ms= key=`,
-`BOARD sessions= claims=`). Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
+(`--socket`; prints `SESSION address= host= label=`, `CLAIM holder= remaining_ms= key=`,
+`BOARD sessions= claims=`). A session may register with `--label <text>`;
+`label --socket <sock> --from <id> --label <text>` changes it. Labels are stored and
+returned verbatim and never change an Address or its mailbox. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
 ## Checks
@@ -31,8 +33,12 @@ scripts/acceptance claims        # proof 4: claims are exclusive, renew, expire;
 scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
 node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter
 scripts/acceptance independence   # proof 2: Pi and Claude Code sessions (plus a Tracer) exchange mail; loopback
+scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
 scripts/check-harness-free        # invariant: no harness identity in the core
 ```
+
+`scripts/acceptance references` reads the Board through `roger board` (proof 4) and also
+searches `src/` for any code that parses a Reference or inspects a label (invariant 3).
 
 `scripts/acceptance independence` needs `pi`, `claude` (logged in) and `node`. It makes one
 real Claude Code model call (haiku); Pi needs none. Claude's tool results are read from its

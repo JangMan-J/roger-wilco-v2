@@ -41,6 +41,7 @@ fn main() -> io::Result<()> {
                 Some(id) => id,
                 None => session::gen_uuid()?,
             },
+            arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--hold-before-ack").map(PathBuf::from),
         ),
@@ -50,6 +51,7 @@ fn main() -> io::Result<()> {
                 Some(id) => id,
                 None => session::gen_uuid()?,
             },
+            arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
             arg(&args, "--hold-before-ack").map(PathBuf::from),
         ),
@@ -87,8 +89,13 @@ fn main() -> io::Result<()> {
             Ok(())
         }
         "board" => session::board(PathBuf::from(need(&args, "--socket")?)),
+        "label" => session::relabel(
+            PathBuf::from(need(&args, "--socket")?),
+            need(&args, "--from")?,
+            need(&args, "--label")?,
+        ),
         _ => {
-            eprintln!("usage: roger <coordinator|daemon|session|adapter|send> [flags]");
+            eprintln!("usage: roger <coordinator|daemon|session|adapter|send|claim|renew|release|board|label> [flags]");
             std::process::exit(2);
         }
     }

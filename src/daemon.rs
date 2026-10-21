@@ -182,16 +182,20 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
             "hello refused",
         ));
     }
-    let (known, receipts): (Vec<String>, Vec<Receipt>) = {
+    let (known, receipts): (Vec<Value>, Vec<Receipt>) = {
         let mut st = state.lock().unwrap();
         st.upstream = Some(Arc::clone(&writer));
-        (st.sessions.keys().cloned().collect(), st.receipts.clone())
+        // Labels are not repeated here: the coordinator's log already holds
+        // the latest one, and a relabel may have gone through another host.
+        let known = st
+            .sessions
+            .keys()
+            .map(|id| register_msg(id, None))
+            .collect();
+        (known, st.receipts.clone())
     };
-    for session in known {
-        let _ = net::send(
-            &writer,
-            &obj(vec![("type", s("register")), ("session", s(&session))]),
-        );
+    for msg in known {
+        let _ = net::send(&writer, &msg);
     }
     // A receipt committed while upstream was down still has to arrive. The
     // coordinator's acked answers trim `receipts` in the loop below.
@@ -235,7 +239,7 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
                     );
                 }
             }
-            "accepted" | "claim_result" | "board" => {
+            "accepted" | "claim_result" | "board" | "relabeled" => {
                 if let Some(req) = v.get("req").and_then(|x| x.as_i64()) {
                     let waiter = state.lock().unwrap().waiters.remove(&req);
                     if let Some(tx) = waiter {
@@ -247,6 +251,14 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn register_msg(session: &str, label: Option<&str>) -> Value {
+    let mut pairs = vec![("type", s("register")), ("session", s(session))];
+    if let Some(label) = label {
+        pairs.push(("label", s(label)));
+    }
+    obj(pairs)
 }
 
 fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
@@ -317,6 +329,15 @@ fn upstream_request(state: &Arc<Mutex<State>>, mut v: Value) -> io::Result<Value
     })
 }
 
+/// An upstream reply, re-tagged with the local request number it answers.
+fn with_req(mut v: Value, req: i64) -> Value {
+    if let Value::Obj(pairs) = &mut v {
+        pairs.retain(|(k, _)| k != "req");
+        pairs.push(("req".to_string(), Value::Int(req)));
+    }
+    v
+}
+
 fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     let writer = net::writer(Box::new(conn.try_clone()?));
     let lines = net::lines(Box::new(conn));
@@ -343,6 +364,7 @@ fn local_loop(
         match net::field(&v, "type")? {
             "register" => {
                 let session = net::field(&v, "session")?.to_string();
+                let label = v.get("label").and_then(|x| x.as_str()).map(str::to_string);
                 *session_id = Some(session.clone());
                 let (upstream, pending) = {
                     let mut st = state.lock().unwrap();
@@ -363,10 +385,7 @@ fn local_loop(
                     (st.upstream.clone(), pending)
                 };
                 if let Some(up) = upstream {
-                    let _ = net::send(
-                        &up,
-                        &obj(vec![("type", s("register")), ("session", s(&session))]),
-                    );
+                    let _ = net::send(&up, &register_msg(&session, label.as_deref()));
                 }
                 for p in pending {
                     let _ = net::send(writer, &p);
@@ -392,6 +411,20 @@ fn local_loop(
                         ("mail", s(net::field(&resp, "mail")?)),
                     ]),
                 )?;
+            }
+            "relabel" => {
+                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let session = net::field(&v, "session")?.to_string();
+                let label = net::field(&v, "label")?.to_string();
+                let resp = upstream_request(
+                    state,
+                    obj(vec![
+                        ("type", s("relabel")),
+                        ("session", s(&session)),
+                        ("label", s(&label)),
+                    ]),
+                )?;
+                net::send(writer, &with_req(resp, req))?;
             }
             "ack" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);

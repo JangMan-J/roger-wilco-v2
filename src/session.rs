@@ -14,10 +14,11 @@ use std::path::PathBuf;
 pub fn run(
     socket: PathBuf,
     id: String,
+    label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
 ) -> io::Result<()> {
-    serve(socket, id, store_path, hold_before_ack, None)
+    serve(socket, id, label, store_path, hold_before_ack, None)
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
@@ -28,6 +29,7 @@ pub fn run(
 pub fn adapter(
     socket: PathBuf,
     id: String,
+    label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
 ) -> io::Result<()> {
@@ -58,7 +60,7 @@ pub fn adapter(
         // The shim's stdin closed: its harness is gone, so this session is too.
         std::process::exit(0);
     });
-    serve(socket, id, store_path, hold_before_ack, Some(out))
+    serve(socket, id, label, store_path, hold_before_ack, Some(out))
 }
 
 fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
@@ -87,6 +89,7 @@ fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
 fn serve(
     socket: PathBuf,
     id: String,
+    label: Option<String>,
     store_path: PathBuf,
     hold_before_ack: Option<PathBuf>,
     shim: Option<net::Writer>,
@@ -105,10 +108,11 @@ fn serve(
     let conn = UnixStream::connect(&socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     let lines = net::lines(Box::new(conn));
-    net::send(
-        &writer,
-        &obj(vec![("type", s("register")), ("session", s(&id))]),
-    )?;
+    let mut register = vec![("type", s("register")), ("session", s(&id))];
+    if let Some(label) = &label {
+        register.push(("label", s(label)));
+    }
+    net::send(&writer, &obj(register))?;
     match &shim {
         Some(w) => net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?,
         None => {
@@ -200,6 +204,21 @@ pub fn send(
 ) -> io::Result<()> {
     let mail = send_mail(&socket, &from, &to, &mail, &body)?;
     println!("ACCEPTED mail={mail}");
+    Ok(())
+}
+
+/// The client: give a session a new label. Its Address and mailbox stay.
+pub fn relabel(socket: PathBuf, session: String, label: String) -> io::Result<()> {
+    let reply = request(
+        &socket,
+        &obj(vec![
+            ("type", s("relabel")),
+            ("req", Value::Int(1)),
+            ("session", s(&session)),
+            ("label", s(&label)),
+        ]),
+    )?;
+    println!("RELABELED {}", json::stringify(&reply));
     Ok(())
 }
 
@@ -300,9 +319,10 @@ pub fn board(socket: PathBuf) -> io::Result<()> {
     let (sessions, claims) = (list("sessions"), list("claims"));
     for v in &sessions {
         println!(
-            "SESSION address={} host={}",
+            "SESSION address={} host={} label={}",
             net::field(v, "session")?,
-            net::field(v, "host")?
+            net::field(v, "host")?,
+            net::field(v, "label")?
         );
     }
     for v in &claims {
