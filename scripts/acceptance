@@ -346,14 +346,17 @@ pi_shim() {
   pi_stop
 
   # session_start recurs on new_session: still one adapter on this Store.
-  local adapters='pgrep -fc "adapter --socket '"$work"'/a.sock"'
+  # A function, so wait_for recounts on every try (a "$(...)" argument would
+  # be expanded once, before the first try).
+  adapters() { pgrep -fc "adapter --socket $work/a.sock" || true; }
+  adapters_are() { [[ "$(adapters)" == "$1" ]]; }
   pi_start recur "$SENDER" "$bin" "$ext"
-  wait_for 10 "one adapter" test "$(eval "$adapters")" = 1
+  wait_for 10 "one adapter" adapters_are 1
   pi_call new1 '{"type":"new_session"}' || fail "new_session unanswered"
   pi_call new2 '{"type":"new_session"}' || fail "new_session unanswered"
-  [[ "$(eval "$adapters")" == 1 ]] || fail "session_start left more than one adapter on the Store"
+  adapters_are 1 || fail "session_start left more than one adapter on the Store"
   pi_stop
-  wait_for 10 "adapter exits with Pi" test "$(eval "$adapters")" = 0
+  wait_for 10 "adapter exits with Pi" adapters_are 0
 
   # The model-facing roger_send tool's callback, invoked directly in the
   # real Pi runtime (no model call), reaches the Tracer.
