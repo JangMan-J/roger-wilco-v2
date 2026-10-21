@@ -22,6 +22,7 @@ struct Mail {
     from: String,
     to: String,
     body: String,
+    wake: bool,
 }
 
 /// A receipt committed to this host's log: which Mail, which session acked
@@ -119,6 +120,7 @@ fn apply(state: &mut State, v: &Value) {
                             from: from.into(),
                             to: to.into(),
                             body: body.into(),
+                            wake: net::wake_of(v),
                         },
                     );
                 }
@@ -259,6 +261,7 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
                 from: net::field(v, "from")?.into(),
                 to: net::field(v, "to")?.into(),
                 body: net::field(v, "body")?.into(),
+                wake: net::wake_of(v),
             };
             let ev = obj(vec![
                 ("ev", s("deliver")),
@@ -266,6 +269,7 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
                 ("from", s(&m.from)),
                 ("to", s(&m.to)),
                 ("body", s(&m.body)),
+                ("wake", Value::Bool(m.wake)),
             ]);
             st.log.append(&json::stringify(&ev))?;
             st.order.push(mail_id.clone());
@@ -276,7 +280,7 @@ fn handle_deliver(state: &Arc<Mutex<State>>, v: &Value) -> io::Result<()> {
             if let Some(w) = st.sessions.get(&m.to) {
                 push = Some((
                     Arc::clone(w),
-                    net::deliver_msg(&mail_id, &m.from, &m.to, &m.body),
+                    net::deliver_msg(&mail_id, &m.from, &m.to, &m.body, m.wake),
                 ));
             }
         }
@@ -357,6 +361,7 @@ fn local_loop(
                                 &st.inbox[id].from,
                                 &st.inbox[id].to,
                                 &st.inbox[id].body,
+                                st.inbox[id].wake,
                             )
                         })
                         .collect();

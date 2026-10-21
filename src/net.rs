@@ -18,15 +18,23 @@ pub fn ack_msg(mail: &str, session: &str, record: &str) -> Value {
 }
 
 /// The one shape both the coordinator and a host daemon use to hand a Mail
-/// to the next hop.
-pub fn deliver_msg(mail: &str, from: &str, to: &str, body: &str) -> Value {
+/// to the next hop. `wake` is false only for a Broadcast copy, which makes
+/// no wake request.
+pub fn deliver_msg(mail: &str, from: &str, to: &str, body: &str, wake: bool) -> Value {
     obj(vec![
         ("type", s("deliver")),
         ("mail", s(mail)),
         ("from", s(from)),
         ("to", s(to)),
         ("body", s(body)),
+        ("wake", Value::Bool(wake)),
     ])
+}
+
+/// A deliver line's wake request; a line without one (written before the
+/// field existed) is directed mail, which requests a wake.
+pub fn wake_of(v: &Value) -> bool {
+    !matches!(v.get("wake"), Some(Value::Bool(false)))
 }
 
 pub fn writer(w: Box<dyn Write + Send>) -> Writer {

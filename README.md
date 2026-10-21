@@ -16,7 +16,11 @@ One binary, no external crates. `roger` subcommands: `coordinator`,
 line stream for a shim), `send`, and the claim and Board client: `claim`, `renew`,
 `release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused) and `board`
 (`--socket`; prints `SESSION address= host=`, `CLAIM holder= remaining_ms= key=`,
-`BOARD sessions= claims=`). Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
+`BOARD sessions= claims=`). `send --to '*'` is a Broadcast: the coordinator commits it once and fans it
+out to every session registered at that moment, one Mail per recipient with id
+`<mail>/<address>`, each delivered and acked like directed mail. Every delivery
+carries `wake`: true for directed mail, false for a broadcast copy; the Tracer
+prints it on its `STORED` line and the adapter passes it to the shim. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
 ## Checks
@@ -27,6 +31,7 @@ warnings denied, tests, harness-free). Review rules are in `CODING_STANDARDS.md`
 ```sh
 scripts/check                     # the gate
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
+scripts/acceptance broadcast     # proof 3: one broadcast reaches every registered session once, no wake
 scripts/acceptance claims        # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
 node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter

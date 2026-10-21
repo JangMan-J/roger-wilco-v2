@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims>
+# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims|broadcast>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -423,10 +423,83 @@ claims() {
   echo "PASS claims: second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from decent-spider and agent-jail showed one holder"
 }
 
+# Proof 3. Two hosts, one coordinator. Three registered sessions: the
+# sender's own on decent-spider, an idle one on agent-jail, and one on
+# agent-jail that is SIGKILLed between its Store write and its Ack. One
+# broadcast must land in every Store exactly once. "Starts no turn": a session
+# starts a turn only on a wake request, and each session reports the wake
+# request its delivery carried; every broadcast copy must report wake=false.
+IDLE="44444444-4444-4444-8444-444444444444"
+broadcast() {
+  local mail="bcast-1" body="fleet notice [[0:FLEET:0]] to every session"
+  two_host_stack
+
+  "$bin" session --socket "$work/a.sock" --id "$SENDER" --store "$work/sender.store" \
+    >"$work/sender.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "sender READY" grep -q READY "$work/sender.out"
+  remote_spawn idle.pid idle.out \
+    "./roger session --socket $remote_work/b.sock --id $IDLE --store $remote_work/idle.store" \
+    || fail "start remote idle session"
+  remote_spawn recipient.pid recipient1.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "start remote recipient"
+  wait_for 15 "three sessions registered at the coordinator" log_count '"ev":"session"' 3 "$work/coord.log"
+
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
+    | grep -q "ACCEPTED mail=$mail" || fail "broadcast not accepted"
+
+  wait_for 15 "recipient stored and holding before ack" \
+    ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
+  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" || fail "SIGKILL recipient"
+  wait_for 15 "receipts from the two live sessions" log_count '"ev":"receipt"' 2 "$work/coord.log"
+  grep -qF "\"mail\":\"$mail/$RECIPIENT\",\"session\"" "$work/coord.log" \
+    && fail "receipt for the killed recipient exists before it acked"
+
+  remote_spawn recipient.pid recipient2.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "restart remote recipient"
+  wait_for 15 "DELIVERED after restart" \
+    ssh -n "$REMOTE_HOST" "grep -q 'DELIVERED mail=$mail/$RECIPIENT record=r-1' $remote_work/recipient2.out"
+  wait_for 15 "three receipts" log_count '"ev":"receipt"' 3 "$work/coord.log"
+
+  # A resent broadcast id fans out nothing new.
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
+    | grep -q "ACCEPTED mail=$mail" || fail "resent broadcast not accepted"
+  log_count '"ev":"broadcast"' 1 "$work/coord.log" || fail "coordinator must hold one broadcast event"
+  log_count '"ev":"mail"' 0 "$work/coord.log" || fail "a broadcast must not be stored as directed mail"
+
+  local addr
+  for addr in "$SENDER" "$IDLE" "$RECIPIENT"; do
+    log_count "\"ev\":\"receipt\",\"mail\":\"$mail/$addr\"" 1 "$work/coord.log" \
+      || fail "coordinator must hold exactly one receipt for $addr"
+  done
+
+  local spec store out where
+  for spec in "local sender" "remote idle" "remote recipient"; do
+    read -r where store <<<"$spec"
+    out="${store}.out"; [[ "$store" == recipient ]] && out=recipient1.out
+    if [[ "$where" == local ]]; then
+      log_count "$body" 1 "$work/$store.store" || fail "$store Store must hold the body once"
+      [[ "$(wc -l <"$work/$store.store")" == 1 ]] || fail "$store Store holds extra records"
+      grep -q "^STORED mail=$mail/.* record=r-1 wake=false$" "$work/$out" || fail "$store: delivery carried a wake request"
+    else
+      ssh -n "$REMOTE_HOST" "test \"\$(grep -cF '$body' $remote_work/$store.store)\" = 1 && test \"\$(wc -l <$remote_work/$store.store)\" = 1" \
+        || fail "$store Store on $REMOTE_HOST must hold the body exactly once"
+      ssh -n "$REMOTE_HOST" "grep -q '^STORED mail=$mail/.* record=r-1 wake=false\$' $remote_work/$out" \
+        || fail "$store: delivery carried a wake request"
+    fi
+  done
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS broadcast: one broadcast reached all three registered sessions on decent-spider and agent-jail, including an idle one and one SIGKILLed between Store and Ack, exactly once each, every copy without a wake request"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
   independence) independence ;;
   pi-shim) pi_shim ;;
   claims) claims ;;
-  *) echo "usage: $0 <cross-host|independence|pi-shim|claims>" >&2; exit 2 ;;
+  broadcast) broadcast ;;
+  *) echo "usage: $0 <cross-host|independence|pi-shim|claims|broadcast>" >&2; exit 2 ;;
 esac

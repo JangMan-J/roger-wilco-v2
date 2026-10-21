@@ -8,7 +8,7 @@ use crate::claims::{Change, Claims, Held, Op};
 use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpListener;
 use std::path::PathBuf;
@@ -20,13 +20,20 @@ struct Mail {
     to: String,
     body: String,
     acked: bool,
+    /// False only for a Broadcast copy: a broadcast makes no wake request.
+    wake: bool,
 }
+
+/// The Address a send names to reach every registered session at once.
+pub const BROADCAST: &str = "*";
 
 struct State {
     log: DurLog,
     sessions: HashMap<String, String>, // session -> host
     mails: HashMap<String, Mail>,
     order: Vec<String>,
+    /// Broadcast ids already committed, so a resent broadcast fans out once.
+    broadcasts: HashSet<String>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
     claims: Claims,
@@ -48,6 +55,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         sessions: HashMap::new(),
         mails: HashMap::new(),
         order: Vec::new(),
+        broadcasts: HashSet::new(),
         hosts: HashMap::new(),
         next_conn: 1,
         claims: Claims::default(),
@@ -100,8 +108,23 @@ fn apply(state: &mut State, v: &Value) {
                         to: to.into(),
                         body: body.into(),
                         acked: false,
+                        wake: true,
                     },
                 );
+            }
+        }
+        Some("broadcast") => {
+            if let (Ok(mail), Ok(from), Ok(body), Some(Value::Arr(to))) = (
+                net::field(v, "mail"),
+                net::field(v, "from"),
+                net::field(v, "body"),
+                v.get("to"),
+            ) {
+                let to: Vec<String> = to
+                    .iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect();
+                fan_out(state, mail, from, body, &to);
             }
         }
         Some("receipt") => {
@@ -148,7 +171,7 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
         } else if state.sessions.get(&m.to).map(|h| h.as_str()) != Some(host) {
             continue;
         }
-        out.push(net::deliver_msg(id, &m.from, &m.to, &m.body));
+        out.push(net::deliver_msg(id, &m.from, &m.to, &m.body, m.wake));
     }
     out
 }
@@ -205,15 +228,23 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             "send" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let mail = net::field(&v, "mail")?.to_string();
-                let mut push: Option<(Writer, Value)> = None;
+                let mut push: Vec<(Writer, Value)> = Vec::new();
                 {
                     let mut st = state.lock().unwrap();
-                    if !st.mails.contains_key(&mail) {
+                    if net::field(&v, "to")? == BROADCAST {
+                        push = broadcast(
+                            &mut st,
+                            &mail,
+                            net::field(&v, "from")?,
+                            net::field(&v, "body")?,
+                        )?;
+                    } else if !st.mails.contains_key(&mail) {
                         let m = Mail {
                             from: net::field(&v, "from")?.into(),
                             to: net::field(&v, "to")?.into(),
                             body: net::field(&v, "body")?.into(),
                             acked: false,
+                            wake: true,
                         };
                         let ev = obj(vec![
                             ("ev", s("mail")),
@@ -225,9 +256,9 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         st.log.append(&json::stringify(&ev))?;
                         if let Some(host_of) = st.sessions.get(&m.to).cloned() {
                             if let Some((_, w)) = st.hosts.get(&host_of) {
-                                push = Some((
+                                push.push((
                                     Arc::clone(w),
-                                    net::deliver_msg(&mail, &m.from, &m.to, &m.body),
+                                    net::deliver_msg(&mail, &m.from, &m.to, &m.body, true),
                                 ));
                             }
                         }
@@ -243,7 +274,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         ("mail", s(&mail)),
                     ]),
                 )?;
-                if let Some((w, msg)) = push {
+                for (w, msg) in push {
                     let _ = net::send(&w, &msg);
                 }
             }
@@ -414,4 +445,71 @@ fn board(st: &State, v: &Value) -> Value {
         ("sessions", Value::Arr(sessions)),
         ("claims", Value::Arr(claims)),
     ])
+}
+
+/// The Mail id of one Broadcast copy: the broadcast's id and the recipient's
+/// Address, so each recipient's copy is delivered, stored, and acked once.
+fn copy_id(mail: &str, to: &str) -> String {
+    format!("{mail}/{to}")
+}
+
+/// Expand a committed Broadcast into one Mail per recipient, carrying no wake
+/// request. Used on commit and on replay, so both see the same copies.
+fn fan_out(st: &mut State, mail: &str, from: &str, body: &str, to: &[String]) {
+    if !st.broadcasts.insert(mail.to_string()) {
+        return;
+    }
+    for addr in to {
+        let id = copy_id(mail, addr);
+        if st.mails.contains_key(&id) {
+            continue;
+        }
+        st.order.push(id.clone());
+        st.mails.insert(
+            id,
+            Mail {
+                from: from.to_string(),
+                to: addr.clone(),
+                body: body.to_string(),
+                acked: false,
+                wake: false,
+            },
+        );
+    }
+}
+
+/// Commit one Broadcast to every session registered at this moment, as a
+/// single durable event, then return the deliveries to push to connected
+/// host daemons. A resent broadcast id commits nothing.
+fn broadcast(
+    st: &mut State,
+    mail: &str,
+    from: &str,
+    body: &str,
+) -> io::Result<Vec<(Writer, Value)>> {
+    if st.broadcasts.contains(mail) {
+        return Ok(Vec::new());
+    }
+    let mut to: Vec<String> = st.sessions.keys().cloned().collect();
+    to.sort();
+    let ev = obj(vec![
+        ("ev", s("broadcast")),
+        ("mail", s(mail)),
+        ("from", s(from)),
+        ("body", s(body)),
+        ("to", Value::Arr(to.iter().map(|a| s(a)).collect())),
+    ]);
+    st.log.append(&json::stringify(&ev))?;
+    fan_out(st, mail, from, body, &to);
+    let mut push = Vec::new();
+    for addr in &to {
+        let host = st.sessions.get(addr);
+        if let Some((_, w)) = host.and_then(|h| st.hosts.get(h)) {
+            push.push((
+                Arc::clone(w),
+                net::deliver_msg(&copy_id(mail, addr), from, addr, body, false),
+            ));
+        }
+    }
+    Ok(push)
 }
