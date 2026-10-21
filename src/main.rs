@@ -68,7 +68,8 @@ fn main() -> io::Result<()> {
             need(&args, "--body")?,
         ),
         "claim" | "renew" | "release" => {
-            let op = if cmd == "claim" { "acquire" } else { cmd };
+            let op = claims::Op::parse(if cmd == "claim" { "acquire" } else { cmd })
+                .expect("the match arm names only claim ops");
             let ttl_ms = match arg(&args, "--ttl-ms") {
                 Some(t) => t.parse().map_err(|_| {
                     io::Error::new(
@@ -80,7 +81,7 @@ fn main() -> io::Result<()> {
             };
             let granted = session::claim(
                 PathBuf::from(need(&args, "--socket")?),
-                op,
+                &op,
                 need(&args, "--owner")?,
                 need(&args, "--key")?,
                 ttl_ms,

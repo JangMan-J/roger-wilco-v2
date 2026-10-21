@@ -918,11 +918,16 @@ fn claim_cmd(rig: &Rig, sock: &str, verb: &str, owner: &str, ttl_ms: u64) -> (i3
     )
 }
 
-fn board(rig: &Rig, sock: &str) -> String {
-    let output = Command::new(BIN)
+/// One `roger board` read on a host's daemon socket, however it ended.
+fn board_output(rig: &Rig, sock: &str) -> std::process::Output {
+    Command::new(BIN)
         .args(["board", "--socket", rig.p(sock).to_str().unwrap()])
         .output()
-        .unwrap();
+        .unwrap()
+}
+
+fn board(rig: &Rig, sock: &str) -> String {
+    let output = board_output(rig, sock);
     assert!(output.status.success(), "board failed: {output:?}");
     String::from_utf8_lossy(&output.stdout).to_string()
 }
@@ -1062,13 +1067,7 @@ fn claim_survives_a_coordinator_restart() {
 fn wait_until_board_reaches_both(rig: &Rig) {
     let deadline = Instant::now() + Duration::from_secs(10);
     for sock in ["a.sock", "b.sock"] {
-        while !Command::new(BIN)
-            .args(["board", "--socket", rig.p(sock).to_str().unwrap()])
-            .output()
-            .unwrap()
-            .status
-            .success()
-        {
+        while !board_output(rig, sock).status.success() {
             assert!(
                 Instant::now() < deadline,
                 "{sock} never reached the coordinator"

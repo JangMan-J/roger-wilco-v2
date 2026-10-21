@@ -30,6 +30,17 @@ itself at Register, stored by the core and returned verbatim; `board` prints it 
 `DECLARED address= declared=` line after that session's `SESSION` line. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
+## Claims
+
+A claim's deadline is `now + ttl_ms` on the coordinator's wall clock, in milliseconds
+since the Unix epoch, and is stored absolute so it survives a restart; a monotonic
+clock alone cannot do that. The coordinator therefore trusts its own clock: a forward
+step (NTP, suspend and resume) frees held keys early and a backward step extends them.
+The holder may repeat either grant and land in the same state: `claim` by the current
+holder is a retry-safe refresh that resets the deadline, and `renew` sets the deadline
+to `now + ttl_ms` even when that is sooner than before. One failed log append stops
+the coordinator rather than letting memory and disk diverge; a restart replays the log.
+
 ## Checks
 
 `scripts/check` is the gate every change passes before it lands on main (fmt, clippy with

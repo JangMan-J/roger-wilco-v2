@@ -35,5 +35,9 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
   that exercises real processes, plus the narrowest unit or process test that would
   catch a regression. Match test depth to the risk the proof names.
 - Errors are `io::Result`; a failure names what was expected and what was seen.
+- Claim deadlines are wall-clock epoch milliseconds read on the coordinator (`now_ms`),
+  stored absolute so they survive a restart; a monotonic clock alone cannot. A forward
+  clock step frees keys early and a backward one extends them. Nothing in `src/` reads
+  another clock for a claim.
 - Keep `src/main.rs` dispatch flat: add an arm, do not restructure.
 - Vectors, not comments, record what was tried; GLOSSARY.md, not comments, defines terms.

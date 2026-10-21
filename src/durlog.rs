@@ -1,6 +1,11 @@
 //! Append-only durable line log: each append is written and fsynced before
 //! it returns. Replay yields complete lines only; a trailing fragment left
 //! by a crash mid-append is dropped.
+//!
+//! One failed append poisons the log: the bytes may have reached the disk
+//! even though the caller saw an error and left memory unchanged, so no
+//! later append may commit on top of that split. Every later append returns
+//! an error naming the first failure; the owner restarts and replays.
 
 use std::fs::File;
 use std::io;
@@ -8,6 +13,8 @@ use std::path::Path;
 
 pub struct DurLog {
     file: File,
+    /// The first append failure, kept so every later append refuses.
+    poison: Option<String>,
 }
 
 impl DurLog {
@@ -55,12 +62,32 @@ impl DurLog {
                 }
             }
         }
-        Ok((DurLog { file }, lines))
+        Ok((DurLog { file, poison: None }, lines))
+    }
+
+    #[cfg(test)]
+    fn from_file(file: File) -> DurLog {
+        DurLog { file, poison: None }
+    }
+
+    /// True once an append has failed: nothing appended since has committed.
+    pub fn is_poisoned(&self) -> bool {
+        self.poison.is_some()
     }
 
     pub fn append(&mut self, line: &str) -> io::Result<()> {
-        use std::io::Write;
         debug_assert!(!line.contains('\n'));
+        if let Some(first) = &self.poison {
+            return Err(io::Error::other(format!(
+                "expected a durable log, saw one poisoned by an earlier append failure: {first}"
+            )));
+        }
+        self.write_line(line)
+            .inspect_err(|e| self.poison = Some(e.to_string()))
+    }
+
+    fn write_line(&mut self, line: &str) -> io::Result<()> {
+        use std::io::Write;
         self.file.write_all(line.as_bytes())?;
         self.file.write_all(b"\n")?;
         self.file.sync_all()
@@ -94,6 +121,25 @@ mod tests {
             vec!["{\"a\":1}".to_string(), "{\"b\":2}".to_string()]
         );
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn one_failed_append_poisons_every_later_append() {
+        // /dev/full accepts the open and fails every write with ENOSPC, so
+        // the first append fails for a real filesystem reason and the second
+        // must fail for the poison alone.
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/full")
+            .unwrap();
+        let mut log = DurLog::from_file(file);
+        assert!(!log.is_poisoned());
+        let first = log.append("{\"a\":1}").unwrap_err();
+        assert!(log.is_poisoned());
+        let second = log.append("{\"b\":2}").unwrap_err();
+        let msg = second.to_string();
+        assert!(msg.contains("poisoned"), "{msg}");
+        assert!(msg.contains(&first.to_string()), "{msg} / {first}");
     }
 
     #[test]
