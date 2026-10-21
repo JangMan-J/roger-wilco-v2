@@ -141,7 +141,10 @@ fn serve(
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
                         if shim.is_none() {
-                            println!("STORED mail={mail} record={record}");
+                            println!(
+                                "STORED mail={mail} record={record} wake={}",
+                                net::wake_of(&v)
+                            );
                             io::stdout().flush()?;
                         }
                         record
@@ -156,6 +159,7 @@ fn serve(
                             ("from", s(net::field(&v, "from")?)),
                             ("body", s(net::field(&v, "body")?)),
                             ("record", s(&record)),
+                            ("wake", Value::Bool(net::wake_of(&v))),
                         ]),
                     )?;
                 }

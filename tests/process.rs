@@ -1016,3 +1016,110 @@ fn wait_until_board_reaches_both(rig: &Rig) {
         }
     }
 }
+
+const IDLE: &str = "44444444-4444-4444-8444-444444444444";
+
+fn start_session(rig: &mut Rig, sock: &str, id: &str, store: &str, out: &str) -> usize {
+    let args = [
+        "session",
+        "--socket",
+        rig.p(sock).to_str().unwrap(),
+        "--id",
+        id,
+        "--store",
+        rig.p(store).to_str().unwrap(),
+    ]
+    .map(String::from);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let idx = rig.spawn(&refs, out);
+    wait_for_text(&rig.p(out), "READY", Duration::from_secs(10));
+    idx
+}
+
+fn wait_for_count(path: &Path, needle: &str, n: usize) {
+    let start = Instant::now();
+    while count_lines_with(&read(path), needle) != n {
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "expected {n} lines with {needle:?} in {}: {}",
+            path.display(),
+            read(path)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn broadcast_reaches_every_registered_session_once_without_a_wake() {
+    let mut rig = Rig::new("broadcast");
+    rig.start_stack();
+    start_session(&mut rig, "a.sock", SENDER, "sender.store", "sender.out");
+    start_session(&mut rig, "b.sock", IDLE, "idle.store", "idle.out");
+    let recipient = rig.start_recipient("recipient1.out", true);
+    wait_for_count(&rig.p("coord.log"), "\"ev\":\"session\"", 3);
+
+    let body = "fleet notice [[0:FLEET:0]]";
+    let output = Command::new(BIN)
+        .args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args([
+            "--from", SENDER, "--to", "*", "--mail", "b-1", "--body", body,
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+
+    // Kill the held recipient between its Store write and its ack, then
+    // restart the coordinator: the copy must come back from its log.
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+    rig.kill(recipient);
+    wait_for_count(&rig.p("coord.log"), "\"ev\":\"receipt\"", 2);
+    rig.restart_coordinator();
+    rig.start_recipient("recipient2.out", true);
+    wait_for_text(
+        &rig.p("recipient2.out"),
+        &format!("DELIVERED mail=b-1/{RECIPIENT} record=r-1"),
+        Duration::from_secs(10),
+    );
+    wait_for_count(&rig.p("coord.log"), "\"ev\":\"receipt\"", 3);
+
+    // A resent broadcast id commits and delivers nothing new.
+    let again = Command::new(BIN)
+        .args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args([
+            "--from", SENDER, "--to", "*", "--mail", "b-1", "--body", body,
+        ])
+        .output()
+        .unwrap();
+    assert!(again.status.success(), "{again:?}");
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(
+        count_lines_with(&coord, "\"ev\":\"broadcast\""),
+        1,
+        "{coord}"
+    );
+
+    for (store, out) in [
+        ("sender.store", "sender.out"),
+        ("idle.store", "idle.out"),
+        ("recipient.store", "recipient1.out"),
+    ] {
+        let text = read(&rig.p(store));
+        assert_eq!(text.lines().count(), 1, "{store}: {text}");
+        assert_eq!(count_lines_with(&text, body), 1, "{store}: {text}");
+        let out = read(&rig.p(out));
+        assert!(out.contains("record=r-1 wake=false"), "{out}");
+    }
+}
+
+#[test]
+fn directed_mail_requests_a_wake() {
+    let mut rig = Rig::new("directed-wake");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+    rig.send("m-1", "directed");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "STORED mail=m-1 record=r-1 wake=true",
+        Duration::from_secs(10),
+    );
+}
