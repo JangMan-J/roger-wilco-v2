@@ -1,9 +1,9 @@
 # Coding standards
 
-The gate is `scripts/check`: fmt, clippy with warnings denied, the test suite, and
-`scripts/check-harness-free`. Nothing lands on main until it exits 0. Clippy's
-`all` group is enabled in `Cargo.toml` `[lints]`; the gate turns those warnings into
-errors.
+The gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
+`scripts/check-harness-free`, and `scripts/check-no-poll`. Nothing lands on main
+until it exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints]`; the
+gate turns those warnings into errors.
 
 ## Review rules
 
@@ -16,6 +16,8 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
 2. **Event-driven only.** No fixed-interval scan on the correctness path. Mail,
    receipts, and claim expiry follow committed events or a Register. A sweep may
    exist only as cleanup that can be disabled without losing or duplicating work.
+   `scripts/check-no-poll` is the check; a non-correctness timed wait carries
+   `// no-poll: <reason>`.
 3. **Opaque integers stay opaque.** Nothing in `src/` compares, branches on, ranks,
    looks up by, or names the integers in a Reference or on a session. They pass
    through byte-identical. `scripts/acceptance references` is the check.

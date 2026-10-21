@@ -161,7 +161,7 @@ fn serve(
                         // Test hook: sit between store write and ack until
                         // killed. On restart the marker exists and we ack.
                         loop {
-                            std::thread::sleep(std::time::Duration::from_secs(3600));
+                            std::thread::park();
                         }
                     }
                 }

@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Invariant check: no fixed-interval scan on the correctness path. Mail,
+# receipts, and claim expiry follow committed events, so core source carries
+# no sleep, timed wait, interval, elapsed-time sweep, or try-and-retry spin.
+#
+# A legitimate non-correctness use (reconnect backoff, a bounded wait that
+# turns a silent peer into an error) is allowed only when the matching line,
+# or the line directly above it, carries a marker with a reason:
+#   // no-poll: <why this is not on the correctness path>
+#
+# Usage: scripts/check-no-poll [subdir ...]   (default: src)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+# Matched (POSIX ERE, substring, fail-closed) against code with any //
+# comment stripped.
+#   sleep            thread::sleep, loop+sleep ticks
+#   *_timeout(      recv_timeout, park_timeout, wait_timeout, set_read_timeout, ...
+#   Instant/elapsed  elapsed-time periodic sweeps
+#   interval         timers and tickers
+#   try_recv/try_lock/yield_now/spin_loop  busy polling
+PATTERN='sleep|_timeout|Instant|\.elapsed\(|[Ii]nterval|try_recv|try_lock|yield_now|spin_loop'
+MARKER='//[[:space:]]*no-poll:[[:space:]]*[^[:space:]]'
+
+dirs=("${@:-src}")
+mapfile -t files < <(find "${dirs[@]}" -name '*.rs' -type f | sort)
+
+hits=""
+if ((${#files[@]})); then
+  hits="$(PAT="$PATTERN" MARK="$MARKER" awk '
+    BEGIN { pat = ENVIRON["PAT"]; marker = ENVIRON["MARK"] }
+    FNR == 1 { prev = "" }
+    {
+      code = $0
+      sub(/\/\/.*/, "", code)
+      if (code ~ pat && $0 !~ marker && prev !~ marker)
+        printf "%s:%d:%s\n", FILENAME, FNR, $0
+      prev = $0
+    }
+  ' "${files[@]}")"
+fi
+
+if [[ -n "$hits" ]]; then
+  echo "FAIL: polling or timed wait in core source (mark a non-correctness use with '// no-poll: <reason>'):" >&2
+  echo "$hits" >&2
+  exit 1
+fi
+
+allowed="$( ((${#files[@]})) && grep -cE "$MARKER" "${files[@]}" | awk -F: '{n += $NF} END {print n+0}' || echo 0)"
+echo "PASS no-poll: no unmarked sleep, timed wait, interval, or polling in ${dirs[*]} ($allowed marked)"

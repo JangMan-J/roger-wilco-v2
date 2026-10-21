@@ -156,6 +156,7 @@ fn upstream_loop(cfg: Arc<Config>, state: Arc<Mutex<State>>) {
         }
         // Reconnect after failure. This never looks for work: the
         // coordinator pushes pending mail when the hello is answered.
+        // no-poll: reconnect backoff after a failed connection; it never looks for work.
         std::thread::sleep(Duration::from_millis(250));
     }
 }
@@ -305,6 +306,7 @@ fn upstream_request(state: &Arc<Mutex<State>>, mut v: Value) -> io::Result<Value
     net::send(&writer, &v)?;
     // Bounded: a coordinator that accepts a request and never answers must
     // not hang the session's send or ack forever.
+    // no-poll: one bounded wait for a single reply, turning a silent coordinator into an error.
     rx.recv_timeout(UPSTREAM_WAIT).map_err(|e| match e {
         mpsc::RecvTimeoutError::Timeout => {
             io::Error::new(io::ErrorKind::TimedOut, "upstream did not answer")
