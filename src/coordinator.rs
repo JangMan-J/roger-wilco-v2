@@ -50,6 +50,11 @@ struct State {
 
 /// Coordinator wall clock in milliseconds since the Unix epoch: the one clock
 /// every claim deadline is set and read against, whichever host asks.
+///
+/// Deadlines are absolute wall-clock instants because they must survive a
+/// restart, which a monotonic clock cannot give. The cost is that the
+/// coordinator trusts its own clock: a forward step (NTP, suspend and
+/// resume) frees held keys early, and a backward step extends them.
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -71,9 +76,12 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         next_conn: 1,
         claims: Claims::default(),
     };
+    // DurLog::open already drops a crash-truncated tail, so every line here
+    // was appended whole. A line that is not JSON is skipped as before; a
+    // claim event that parses but lacks a field fails start-up (see `apply`).
     for line in &prior {
         if let Ok(v) = json::parse(line) {
-            apply(&mut state, &v);
+            apply(&mut state, &v)?;
         }
     }
     let state = Arc::new(Mutex::new(state));
@@ -89,15 +97,25 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         let state = Arc::clone(&state);
         let token = token.clone();
         std::thread::spawn(move || {
-            if let Err(e) = serve(conn, state, &token) {
+            if let Err(e) = serve(conn, Arc::clone(&state), &token) {
                 eprintln!("coordinator connection ended: {e}");
+                // A failed append may have left the disk ahead of memory.
+                // The log refuses every later append; stop here so a
+                // restart replays the disk instead of serving a split view.
+                if state.lock().unwrap().log.is_poisoned() {
+                    eprintln!("coordinator stopping: durable log failed, restart to replay it");
+                    std::process::exit(1);
+                }
             }
         });
     }
     Ok(())
 }
 
-fn apply(state: &mut State, v: &Value) {
+/// Replay one committed event. Claim events must be whole: a `claim` or
+/// `release` line missing a field is an `InvalidData` error that names the
+/// line, so start-up fails instead of silently freeing a held key.
+fn apply(state: &mut State, v: &Value) -> io::Result<()> {
     match v.get("ev").and_then(|x| x.as_str()) {
         Some("session") => {
             if let (Ok(session), Ok(host)) = (net::field(v, "session"), net::field(v, "host")) {
@@ -158,26 +176,13 @@ fn apply(state: &mut State, v: &Value) {
                 }
             }
         }
-        Some("claim") => {
-            if let (Ok(key), Ok(owner), Some(expires_ms)) = (
-                net::field(v, "key"),
-                net::field(v, "owner"),
-                v.get("expires_ms").and_then(|x| x.as_i64()),
-            ) {
-                let change = Change::Grant {
-                    owner: owner.to_string(),
-                    expires_ms,
-                };
-                state.claims.apply(key, &change);
-            }
-        }
-        Some("release") => {
-            if let Ok(key) = net::field(v, "key") {
-                state.claims.apply(key, &Change::Release);
-            }
+        Some("claim" | "release") => {
+            let (key, change) = Change::from_event(v)?;
+            state.claims.apply(&key, &change);
         }
         _ => {}
     }
+    Ok(())
 }
 
 /// Record a session's label verbatim. The label is display only: it never
@@ -267,7 +272,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         }
                         let ev = obj(ev);
                         st.log.append(&json::stringify(&ev))?;
-                        apply(&mut st, &ev);
+                        apply(&mut st, &ev)?;
                     }
                     pending_pushes(&st, &host, Some(&session))
                 };
@@ -487,20 +492,7 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     let now = now_ms();
     let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
     if let Some(change) = &d.change {
-        let ev = match change {
-            Change::Grant { owner, expires_ms } => obj(vec![
-                ("ev", s("claim")),
-                ("key", s(&key)),
-                ("owner", s(owner)),
-                ("expires_ms", Value::Int(*expires_ms)),
-            ]),
-            Change::Release => obj(vec![
-                ("ev", s("release")),
-                ("key", s(&key)),
-                ("owner", s(&owner)),
-            ]),
-        };
-        st.log.append(&json::stringify(&ev))?;
+        st.log.append(&json::stringify(&change.to_event(&key)))?;
         st.claims.apply(&key, change);
     }
     let mut pairs = vec![

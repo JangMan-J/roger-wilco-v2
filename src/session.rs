@@ -2,6 +2,7 @@
 //! writes delivered mail to its own durable Store, and acks naming the
 //! Store record. It knows nothing about the core beyond the socket.
 
+use crate::claims::Op;
 use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net;
@@ -288,15 +289,20 @@ fn request(socket: &PathBuf, v: &Value) -> io::Result<Value> {
     let conn = UnixStream::connect(socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
     net::send(&writer, v)?;
-    let reply = net::lines(Box::new(conn))
-        .next()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no answer"))??;
+    let reply = net::lines(Box::new(conn)).next().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::UnexpectedEof,
+            format!("expected one reply line from {}, saw EOF", socket.display()),
+        )
+    })??;
     if net::field(&reply, "type")? == "error" {
-        return Err(io::Error::other(
-            net::field(&reply, "reason")
-                .unwrap_or("unexplained")
-                .to_string(),
-        ));
+        return Err(io::Error::other(match net::field(&reply, "reason") {
+            Ok(reason) => reason.to_string(),
+            Err(_) => format!(
+                "expected a reason in the error reply, saw {}",
+                json::stringify(&reply)
+            ),
+        }));
     }
     Ok(reply)
 }
@@ -315,7 +321,7 @@ fn holder_text(v: &Value) -> String {
 /// `owner` on `key`. Prints the outcome; returns false when refused.
 pub fn claim(
     socket: PathBuf,
-    op: &str,
+    op: &Op,
     owner: String,
     key: String,
     ttl_ms: i64,
@@ -325,7 +331,7 @@ pub fn claim(
         &obj(vec![
             ("type", s("claim")),
             ("req", Value::Int(1)),
-            ("op", s(op)),
+            ("op", s(op.name())),
             ("key", s(&key)),
             ("owner", s(&owner)),
             ("ttl_ms", Value::Int(ttl_ms)),
@@ -334,15 +340,19 @@ pub fn claim(
     let ok = matches!(reply.get("ok"), Some(Value::Bool(true)));
     let word = match (ok, op) {
         (false, _) => "REFUSED",
-        (true, "acquire") => "CLAIMED",
-        (true, "renew") => "RENEWED",
-        (true, _) => "RELEASED",
+        (true, Op::Acquire) => "CLAIMED",
+        (true, Op::Renew) => "RENEWED",
+        (true, Op::Release) => "RELEASED",
     };
     let reason = match net::field(&reply, "reason") {
         Ok(r) => format!("reason={r:?} "),
         Err(_) => String::new(),
     };
-    println!("{word} op={op} {reason}{}key={key}", holder_text(&reply));
+    println!(
+        "{word} op={} {reason}{}key={key}",
+        op.name(),
+        holder_text(&reply)
+    );
     Ok(ok)
 }
 
