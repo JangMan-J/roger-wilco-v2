@@ -18,7 +18,11 @@ line stream for a shim), `send`. Shims live outside `src/`: `shims/pi/roger.ts` 
 
 ## Checks
 
+`scripts/check` is the gate every change passes before it lands on main (fmt, clippy with
+warnings denied, tests, harness-free). Review rules are in `CODING_STANDARDS.md`.
+
 ```sh
+scripts/check                     # the gate
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
 scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
 node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter

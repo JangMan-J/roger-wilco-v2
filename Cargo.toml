@@ -8,3 +8,6 @@ name = "roger"
 path = "src/main.rs"
 
 [dependencies]
+
+[lints.clippy]
+all = "warn"

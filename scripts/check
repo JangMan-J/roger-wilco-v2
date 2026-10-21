@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# The single gate: every change on main passes this before it lands.
+# Usage: scripts/check
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+step() { echo "== $*"; "$@"; }
+
+step cargo fmt --check
+step cargo clippy --offline --all-targets -- -D warnings
+step cargo test --offline
+step scripts/check-harness-free
+echo "PASS check"
