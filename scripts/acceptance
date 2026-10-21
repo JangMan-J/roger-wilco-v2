@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Acceptance checks named by KERNEL.md proofs.
+# Usage: scripts/acceptance cross-host
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+REMOTE_HOST="${ROGER_REMOTE_HOST:-agent-jail}"
+SENDER="11111111-1111-4111-8111-111111111111"
+RECIPIENT="22222222-2222-4222-8222-222222222222"
+
+# Cleanup runs from the EXIT trap, outside any function scope, so these are
+# script globals rather than locals.
+coord_pid=""
+daemon_pid=""
+work=""
+remote_work=""
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+wait_for() { # wait_for <seconds> <description> <command...>
+  local deadline=$(( $(date +%s) + $1 )); shift
+  local what="$1"; shift
+  while (( $(date +%s) < deadline )); do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 0.2
+  done
+  fail "timed out waiting for: $what"
+}
+
+# Start a detached process on the remote host and record its pid.
+remote_spawn() { # remote_spawn <pid-file-name> <stdout-file> <args...>
+  local pid_name="$1" out="$2"; shift 2
+  local args="$*"
+  ssh -n "$REMOTE_HOST" "bash -lc 'cd $remote_work; ($args >$out 2>&1 </dev/null & echo \$! > $pid_name) ; exit 0'"
+}
+
+cross_host() {
+  command -v tailscale >/dev/null || fail "tailscale CLI required"
+  local ts_ip
+  ts_ip="$(tailscale ip -4 2>/dev/null | head -n1)"
+  [[ -n "$ts_ip" ]] || fail "no tailnet IPv4 on this host"
+
+  (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
+  local bin="$ROOT/target/release/roger"
+
+  local token
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  remote_work="/tmp/roger-accept.$$"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+
+  cleanup() {
+    [[ -n "$coord_pid" ]] && kill "$coord_pid" 2>/dev/null || true
+    [[ -n "$daemon_pid" ]] && kill "$daemon_pid" 2>/dev/null || true
+    ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" \
+      "bash -lc 'for f in ${remote_work}/*.pid; do [ -f \"\$f\" ] && kill \"\$(cat \"\$f\")\" 2>/dev/null; done; sleep 0.3; rm -rf $remote_work; exit 0'" \
+      >/dev/null 2>&1 || true
+    [[ -n "$work" ]] && rm -rf "$work" || true
+  }
+  trap cleanup EXIT
+
+  "$bin" coordinator --bind "$ts_ip:0" --port-file "$work/port" \
+    --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "coordinator port file" test -s "$work/port"
+  local coord="$ts_ip:$(cat "$work/port")"
+
+  "$bin" daemon --coordinator "$coord" --token "$token" \
+    --host-id decent-spider --socket "$work/a.sock" --data "$work/a.log" \
+    >"$work/daemon-a.out" 2>&1 &
+  daemon_pid=$!
+  wait_for 10 "local daemon socket" test -S "$work/a.sock"
+
+  ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" "mkdir -p $remote_work" || fail "ssh mkdir on $REMOTE_HOST"
+  scp -q "$bin" "$REMOTE_HOST:$remote_work/roger" || fail "scp binary"
+
+  remote_spawn daemon.pid daemon.out \
+    "./roger daemon --coordinator $coord --token $token --host-id agent-jail --socket $remote_work/b.sock --data $remote_work/b.log" \
+    || fail "start remote daemon"
+  wait_for 15 "remote daemon socket" ssh -n "$REMOTE_HOST" "test -S $remote_work/b.sock"
+
+  remote_spawn recipient.pid recipient1.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "start remote recipient"
+  wait_for 15 "recipient READY" ssh -n "$REMOTE_HOST" "grep -q READY $remote_work/recipient1.out"
+
+  local body="cross-host proof [[153:Meteor Shower:7]] exactly once"
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail accept-1 --body "$body" | grep -q "ACCEPTED mail=accept-1" || fail "send not accepted"
+
+  # held.marker appears only after the body is fsynced to the recipient's
+  # Store and before the ack leaves. Kill in that window.
+  wait_for 15 "recipient stored and holding before ack" \
+    ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
+  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid); exit 0'" \
+    || fail "SIGKILL recipient"
+
+  if grep -q '"ev":"receipt"' "$work/coord.log"; then
+    fail "receipt exists before the recipient acked"
+  fi
+
+  remote_spawn recipient.pid recipient2.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "restart remote recipient"
+  wait_for 15 "DELIVERED after restart" \
+    ssh -n "$REMOTE_HOST" "grep -q 'DELIVERED mail=accept-1 record=r-1' $remote_work/recipient2.out"
+
+  local store_lines
+  store_lines="$(ssh -n "$REMOTE_HOST" "wc -l < $remote_work/recipient.store" | tr -d ' ')"
+  [[ "$store_lines" == "1" ]] || fail "recipient Store must hold the body exactly once, found $store_lines lines"
+  ssh -n "$REMOTE_HOST" "grep -qF '$body' $remote_work/recipient.store" \
+    || fail "body not byte-identical in recipient Store"
+
+  [[ "$(grep -c '"ev":"mail","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
+    || fail "coordinator holds a duplicate mail row"
+  [[ "$(grep -c '"ev":"receipt","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
+    || fail "coordinator receipt missing or duplicated"
+  grep -q '"record":"r-1"' "$work/coord.log" || fail "receipt does not name Store record r-1"
+
+  echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1"
+}
+
+case "${1:-}" in
+  cross-host) cross_host ;;
+  *) echo "usage: $0 cross-host" >&2; exit 2 ;;
+esac

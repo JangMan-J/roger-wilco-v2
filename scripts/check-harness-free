@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+# Invariant check: the core never learns which harness runs a session.
+# Coordinator, host daemon, client, and adapter name no harness, read no
+# harness store, and link no harness SDK. Only a shim may know.
+#
+# Usage: scripts/check-harness-free [subdir ...]   (default: src)
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+# Whole-word matches only: "pipe" and "copy" must not trip on "pi".
+HARNESSES='pi|claude|claude-code|codex|gemini|cursor|aider|copilot|herdr|zellij|opencode|goose|cline|roo|amp|letta|windsurf'
+
+dirs=("${@:-src}")
+status=0
+
+hits="$(grep -rniE "\b($HARNESSES)\b" "${dirs[@]}" --include='*.rs' || true)"
+if [[ -n "$hits" ]]; then
+  echo "FAIL: harness named in core source:" >&2
+  echo "$hits" >&2
+  status=1
+fi
+
+deps="$(awk '/^\[dependencies\]/{f=1;next} /^\[/{f=0} f && /^[[:space:]]*[A-Za-z0-9_-]+[[:space:]]*=/{print}' Cargo.toml)"
+if [[ -n "$deps" ]]; then
+  echo "FAIL: core links external crates (a harness SDK is one of the risks):" >&2
+  echo "$deps" >&2
+  status=1
+fi
+
+if [[ "$status" == 0 ]]; then
+  echo "PASS harness-free: no harness name in ${dirs[*]}, no external crate dependencies"
+fi
+exit "$status"
