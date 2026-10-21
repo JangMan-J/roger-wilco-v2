@@ -70,7 +70,10 @@ cross_host() {
   daemon_pid=$!
   wait_for 10 "local daemon socket" test -S "$work/a.sock"
 
-  ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" "mkdir -p $remote_work" || fail "ssh mkdir on $REMOTE_HOST"
+  # Clear it first: a directory left by an earlier run that died before its
+  # EXIT trap could satisfy the waits below with nothing running.
+  ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" "bash -lc 'rm -rf $remote_work; mkdir -p $remote_work; exit 0'" \
+    || fail "ssh mkdir on $REMOTE_HOST"
   scp -q "$bin" "$REMOTE_HOST:$remote_work/roger" || fail "scp binary"
 
   remote_spawn daemon.pid daemon.out \
@@ -91,7 +94,9 @@ cross_host() {
   # Store and before the ack leaves. Kill in that window.
   wait_for 15 "recipient stored and holding before ack" \
     ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
-  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid); exit 0'" \
+  # No `exit 0` here: the remote status must be the kill's, so a pid that no
+  # longer exists fails this check instead of passing silently.
+  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" \
     || fail "SIGKILL recipient"
 
   if grep -q '"ev":"receipt"' "$work/coord.log"; then

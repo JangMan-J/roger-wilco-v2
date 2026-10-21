@@ -25,7 +25,8 @@ struct State {
     sessions: HashMap<String, String>, // session -> host
     mails: HashMap<String, Mail>,
     order: Vec<String>,
-    hosts: HashMap<String, Writer>, // host -> live connection
+    hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
+    next_conn: u64,
 }
 
 pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String) -> io::Result<()> {
@@ -36,6 +37,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         mails: HashMap::new(),
         order: Vec::new(),
         hosts: HashMap::new(),
+        next_conn: 1,
     };
     for line in &prior {
         if let Ok(v) = json::parse(line) {
@@ -100,16 +102,6 @@ fn apply(state: &mut State, v: &Value) {
     }
 }
 
-fn deliver_msg(mail_id: &str, m: &Mail) -> Value {
-    obj(vec![
-        ("type", s("deliver")),
-        ("mail", s(mail_id)),
-        ("from", s(&m.from)),
-        ("to", s(&m.to)),
-        ("body", s(&m.body)),
-    ])
-}
-
 /// Pending deliveries for sessions on `host`, or for one session.
 fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<Value> {
     let mut out = Vec::new();
@@ -125,7 +117,7 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
         } else if state.sessions.get(&m.to).map(|h| h.as_str()) != Some(host) {
             continue;
         }
-        out.push(deliver_msg(id, m));
+        out.push(net::deliver_msg(id, &m.from, &m.to, &m.body));
     }
     out
 }
@@ -141,10 +133,13 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         return Err(io::Error::new(io::ErrorKind::PermissionDenied, "bad hello"));
     }
     let host = net::field(&hello, "host")?.to_string();
-    {
+    let conn_id = {
         let mut st = state.lock().unwrap();
-        st.hosts.insert(host.clone(), Arc::clone(&writer));
-    }
+        let id = st.next_conn;
+        st.next_conn += 1;
+        st.hosts.insert(host.clone(), (id, Arc::clone(&writer)));
+        id
+    };
     net::send(&writer, &obj(vec![("type", s("hello_ok"))]))?;
     let pushes = {
         let st = state.lock().unwrap();
@@ -198,8 +193,11 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         ]);
                         st.log.append(&json::stringify(&ev))?;
                         if let Some(host_of) = st.sessions.get(&m.to).cloned() {
-                            if let Some(w) = st.hosts.get(&host_of) {
-                                push = Some((Arc::clone(w), deliver_msg(&mail, &m)));
+                            if let Some((_, w)) = st.hosts.get(&host_of) {
+                                push = Some((
+                                    Arc::clone(w),
+                                    net::deliver_msg(&mail, &m.from, &m.to, &m.body),
+                                ));
                             }
                         }
                         st.order.push(mail.clone());
@@ -259,6 +257,10 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
     }
 
     let mut st = state.lock().unwrap();
-    st.hosts.remove(&host);
+    // Only this connection may take the slot: a host that reconnected while
+    // this thread was finishing already owns it.
+    if st.hosts.get(&host).map(|(id, _)| *id) == Some(conn_id) {
+        st.hosts.remove(&host);
+    }
     Ok(())
 }
