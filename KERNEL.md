@@ -5,6 +5,8 @@ agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
 session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
 ---
 
+> Draft fork of roger-wilco-rebuild. Not promoted; not frozen.
+
 # Roger-Wilco kernel
 
 Roger-Wilco provides durable mail, presence, and exclusive work claims for any agent session on the owner's machines, across hosts, through a core that knows sessions and not harnesses. It stores opaque integer metadata without assigning it meaning, and leaves workflow, meaning, and next actions to consumers.
@@ -32,4 +34,4 @@ This file and the `kernel` namespace of GLOSSARY.md are frozen. Only a fork the 
 
 `kernel`: these terms are defined in GLOSSARY.md under `## kernel`, frozen with this file, and reserved across the glossary.
 
-Agent session, Mail, Ack, Address, Receipt, Store, Core, Coordinator, Host daemon, Harness, Shim, Tracer, Board, Claim, Wake, Reference, Opaque integer, Broadcast
+Agent session, Mail, Ack, Address, Receipt, Store, Core, Coordinator, Host daemon, Harness, Shim, Tracer, Board, Claim, Wake, Reference, Opaque integer, Broadcast, Record id, Token, Host id, Hello, Deliver, Register, Accepted, Acked, Push, Presence

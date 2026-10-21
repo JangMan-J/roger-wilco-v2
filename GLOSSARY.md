@@ -1,7 +1,7 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-21T00:36:50Z
+updated: 2026-10-21T01:28:49Z
 agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
 session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
 ---
@@ -12,7 +12,7 @@ Durable mail, presence, and work claims between agent sessions on one owner's ho
 
 ## kernel
 
-Frozen with KERNEL.md.
+Draft fork namespace: editable until this fork is promoted, frozen with KERNEL.md on promotion.
 
 **Agent session**:
 A process that keeps a durable record of what it has received and speaks the adapter contract; the core never asks which harness runs it.
@@ -21,10 +21,10 @@ _Not_: a shell, a terminal pane, a host.
 _Confirmed_: 2026-10-21, Jang, at init
 
 **Mail**:
-A body of text sent to one agent session or to every session; opaque integers travel inside a reference written in that text, never in a separate metadata field.
-_Example_: a body `start [[0:build:3]] now` carries the label `build` with integers `0` and `3`.
-_Not_: a wake, a receipt, a tool call.
-_Confirmed_: 2026-10-21, Jang, at init
+One record the core stores and delivers: an identifier, a sender Address, a recipient Address, and a body.
+_Example_: `accept-1` from one session to another, body `start [[0:build:3]] now`.
+_Not_: a wake, a receipt, a tool call, the body alone.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
 
 **Ack**:
 The act of naming, to the core, the durable record in which a recipient stored a delivered body.
@@ -121,6 +121,66 @@ One mail body addressed to every registered session; it carries no wake request.
 _Example_: `build finished` sent to all sessions on both hosts.
 _Not_: mail addressed to a list of sessions.
 _Confirmed_: 2026-10-21, Jang, at init
+
+**Record id**:
+The identifier a recipient's Store gives the entry in which it wrote a delivered Mail body; the Receipt names it.
+_Example_: `r-1`, named by the ack that follows the Store write.
+_Not_: a Mail's identifier, an Address.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Token**:
+The shared secret a host daemon presents to the coordinator to be admitted; it carries no per-session meaning.
+_Example_: the value given to the coordinator and to both host daemons for one acceptance run.
+_Not_: a session credential, a rank, a capability.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Host id**:
+The name a host daemon gives the machine it serves; the coordinator uses it to decide which host daemon holds a Mail's recipient.
+_Example_: `agent-jail` for the daemon serving the sessions on agent-jail.
+_Not_: an Address, a harness.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Hello**:
+A host daemon's opening exchange with the coordinator, carrying its Host id and Token; the coordinator answers it by pushing every Mail pending for that host.
+_Example_: the exchange that admits a reconnecting daemon and re-delivers what it has not acked.
+_Not_: a session's Register, a heartbeat.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Deliver**:
+The act of handing one Mail to the recipient's host daemon, or from that daemon to the recipient session; it is not an acknowledgement and starts no turn.
+_Example_: the Push that reaches a session and is written to its Store.
+_Not_: an Ack, a Wake, a send.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Register**:
+A session announcing its Address to its host daemon, which tells the coordinator and then delivers every Mail already pending for that Address.
+_Example_: a restarted session re-announcing itself and receiving the Mail it was killed before acking.
+_Not_: a Claim, a presence report.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Accepted**:
+The coordinator's answer that a Mail is durable in its own store; from that moment the invariant against loss covers it.
+_Example_: the answer to a send, after which killing the recipient cannot lose the body.
+_Not_: a Receipt, a Deliver.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Acked**:
+The coordinator's answer that a Receipt is recorded, naming the recipient's Record id.
+_Example_: the answer that follows an ack naming `r-1`.
+_Not_: an Accepted, a Deliver.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Push**:
+Delivery that follows a committed event or a Register, rather than a scan that looks for work.
+_Example_: a Mail reaching the recipient's host daemon as soon as the coordinator commits it.
+_Not_: a fixed-interval scan, a poll.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
+
+**Presence**:
+The fact that an Address is registered and recently seen, which the Board reports.
+_Example_: a sender reading the Board to find a live recipient.
+_Not_: a Claim, a Wake, a guarantee that a session is alive.
+_Confirmed_: pending (draft fork mail-record, 2026-10-21)
 
 ## invariants
 
