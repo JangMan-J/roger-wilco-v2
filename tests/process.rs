@@ -224,7 +224,13 @@ impl Drop for Rig {
             let _ = c.kill();
             let _ = c.wait();
         }
-        let _ = fs::remove_dir_all(&self.dir);
+        // A panicking test unwinds through Drop, so cleaning up
+        // unconditionally would delete the very logs the panic message cannot
+        // carry. Keep them on failure; Rig::new clears the directory before
+        // the next run of this tag.
+        if !std::thread::panicking() {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
     }
 }
 
