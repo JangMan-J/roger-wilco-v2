@@ -34,4 +34,4 @@ This file and the `kernel` namespace of GLOSSARY.md are frozen. Only a fork the 
 
 `kernel`: these terms are defined in GLOSSARY.md under `## kernel`, frozen with this file, and reserved across the glossary.
 
-Agent session, Mail, Ack, Address, Receipt, Store, Core, Coordinator, Host daemon, Harness, Shim, Tracer, Board, Claim, Wake, Reference, Opaque integer, Broadcast, Record id, Token, Host id, Hello, Deliver, Register, Accepted, Acked, Push, Presence
+Agent session, Mail, Ack, Address, Receipt, Store, Core, Coordinator, Host daemon, Harness, Shim, Tracer, Board, Claim, Wake, Reference, Opaque integer, Broadcast, Record id, Host id, Deliver, Register, Accepted, Presence
