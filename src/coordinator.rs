@@ -39,6 +39,11 @@ struct State {
     labels: HashMap<String, String>,   // session -> label, stored verbatim
     /// Opaque text each session declared at its latest Register, verbatim.
     declared: HashMap<String, String>,
+    /// Presence: when each Address last acted (register, send, ack, or a Board
+    /// read naming it), on the coordinator clock. Set at the moment of the
+    /// act and only read by the Board; memory only, since every live session
+    /// re-registers when its host daemon reconnects.
+    seen: HashMap<String, i64>,
     mails: HashMap<String, Mail>,
     order: Vec<String>,
     /// Broadcast ids already committed, so a resent broadcast fans out once.
@@ -64,6 +69,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         sessions: HashMap::new(),
         labels: HashMap::new(),
         declared: HashMap::new(),
+        seen: HashMap::new(),
         mails: HashMap::new(),
         order: Vec::new(),
         broadcasts: HashSet::new(),
@@ -247,6 +253,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let session = net::field(&v, "session")?.to_string();
                 let pushes = {
                     let mut st = state.lock().unwrap();
+                    st.seen.insert(session.clone(), now_ms());
                     if st.sessions.get(&session).map(|h| h.as_str()) != Some(host.as_str()) {
                         let ev = obj(vec![
                             ("ev", s("session")),
@@ -296,6 +303,8 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let mut push: Vec<(Writer, Value)> = Vec::new();
                 {
                     let mut st = state.lock().unwrap();
+                    st.seen
+                        .insert(net::field(&v, "from")?.to_string(), now_ms());
                     if net::field(&v, "to")? == BROADCAST {
                         push = broadcast(
                             &mut st,
@@ -365,6 +374,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let record = net::field(&v, "record")?.to_string();
                 let known = {
                     let mut st = state.lock().unwrap();
+                    st.seen.insert(session.clone(), now_ms());
                     match st.mails.get(&mail) {
                         None => None,
                         Some(m) => {
@@ -414,7 +424,12 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             }
             "board" => {
                 let reply = {
-                    let st = state.lock().unwrap();
+                    let mut st = state.lock().unwrap();
+                    // A Board read that names its reader is that session's own
+                    // activity.
+                    if let Ok(reader) = net::field(&v, "session") {
+                        st.seen.insert(reader.to_string(), now_ms());
+                    }
                     board(&st, &v)
                 };
                 net::send(&writer, &reply)?;
@@ -514,8 +529,10 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
     Ok(obj(pairs))
 }
 
-/// The Board: registered sessions and every claim live at the moment of the
-/// read.
+/// The Board: registered sessions, each with when it was last seen
+/// (`last_seen_ms`, coordinator epoch ms; 0 when not seen since this
+/// coordinator started), and every claim live at the moment of the read.
+/// Which sessions count as recently seen is the reader's choice.
 fn board(st: &State, v: &Value) -> Value {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let now = now_ms();
@@ -530,6 +547,10 @@ fn board(st: &State, v: &Value) -> Value {
                 (
                     "label",
                     s(st.labels.get(session).map(String::as_str).unwrap_or("")),
+                ),
+                (
+                    "last_seen_ms",
+                    Value::Int(st.seen.get(session).copied().unwrap_or(0)),
                 ),
             ];
             if let Some(d) = st.declared.get(session) {

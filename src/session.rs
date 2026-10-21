@@ -32,9 +32,13 @@ pub fn run(
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
 /// on stdin/stdout for a shim. The shim sends `{"type":"send","to","body"}`
-/// (optional `"mail"`) and is told `ready`, `accepted`, `error`, and `mail`.
-/// A `mail` line follows the Store write and never gates the ack: the shim
-/// renders what the adapter already holds and acknowledges nothing.
+/// (optional `"mail"`), `{"type":"board"}` (read as this session),
+/// `{"type":"relabel","label"}` (optional `"session"`, default this one), or
+/// `{"type":"claim","op","key"}` (optional `"ttl_ms"`, owned by this session),
+/// and is answered in order with `accepted`, `board`, `relabeled`,
+/// `claim_result`, or `error`; it is also told `ready` once and `mail` per delivery. A `mail`
+/// line follows the Store write and never gates the ack: the shim renders
+/// what the adapter already holds and acknowledges nothing.
 /// `declared` is the shim's opaque self-description, sent with Register.
 pub fn adapter(
     socket: PathBuf,
@@ -53,7 +57,7 @@ pub fn adapter(
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Value>>();
     std::thread::spawn(move || {
         for line in rx {
-            let reply = line.and_then(|v| shim_send(&sock, &me, &v));
+            let reply = line.and_then(|v| shim_request(&sock, &me, &v));
             let _ = net::send(
                 &to_shim,
                 &reply.unwrap_or_else(|e| {
@@ -82,10 +86,51 @@ pub fn adapter(
     )
 }
 
-fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
-    if net::field(v, "type")? != "send" {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "expected send"));
+fn shim_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
+    match net::field(v, "type")? {
+        "send" => shim_send(socket, me, v),
+        "board" => request(
+            socket,
+            &obj(vec![
+                ("type", s("board")),
+                ("req", Value::Int(1)),
+                ("session", s(me)),
+            ]),
+        ),
+        "claim" => request(
+            socket,
+            &obj(vec![
+                ("type", s("claim")),
+                ("req", Value::Int(1)),
+                ("op", s(net::field(v, "op")?)),
+                ("key", s(net::field(v, "key")?)),
+                ("owner", s(me)),
+                (
+                    "ttl_ms",
+                    Value::Int(v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0)),
+                ),
+            ]),
+        ),
+        "relabel" => request(
+            socket,
+            &obj(vec![
+                ("type", s("relabel")),
+                ("req", Value::Int(1)),
+                (
+                    "session",
+                    s(v.get("session").and_then(|x| x.as_str()).unwrap_or(me)),
+                ),
+                ("label", s(net::field(v, "label")?)),
+            ]),
+        ),
+        other => Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("unknown request {other}"),
+        )),
     }
+}
+
+fn shim_send(socket: &PathBuf, from: &str, v: &Value) -> io::Result<Value> {
     // A missing mail id is generated; a present one of the wrong type is a
     // malformed send, not a request to pick another id.
     let mail = match v.get("mail") {
@@ -347,12 +392,13 @@ pub fn claim(
 }
 
 /// The client: one Board read, one line per registered session and per live
-/// claim.
-pub fn board(socket: PathBuf) -> io::Result<()> {
-    let reply = request(
-        &socket,
-        &obj(vec![("type", s("board")), ("req", Value::Int(1))]),
-    )?;
+/// claim. `from` names the reading session, which counts as its activity.
+pub fn board(socket: PathBuf, from: Option<String>) -> io::Result<()> {
+    let mut ask = vec![("type", s("board")), ("req", Value::Int(1))];
+    if let Some(from) = &from {
+        ask.push(("session", s(from)));
+    }
+    let reply = request(&socket, &obj(ask))?;
     let list = |name: &str| match reply.get(name) {
         Some(Value::Arr(items)) => items.clone(),
         _ => Vec::new(),
@@ -360,9 +406,10 @@ pub fn board(socket: PathBuf) -> io::Result<()> {
     let (sessions, claims) = (list("sessions"), list("claims"));
     for v in &sessions {
         println!(
-            "SESSION address={} host={} label={}",
+            "SESSION address={} host={} last_seen_ms={} label={}",
             net::field(v, "session")?,
             net::field(v, "host")?,
+            v.get("last_seen_ms").and_then(|x| x.as_i64()).unwrap_or(0),
             net::field(v, "label")?
         );
         // Its own line: label and declared text are both free to the end.

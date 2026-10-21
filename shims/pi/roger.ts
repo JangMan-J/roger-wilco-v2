@@ -18,8 +18,12 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { registerRogerCommand } from "./roger-command.ts";
 
-type Pending = { ok: (mail: string) => void; fail: (e: Error) => void };
+type Reply = Record<string, unknown>;
+type Pending = { ok: (reply: Reply) => void; fail: (e: Error) => void };
+// Adapter lines that answer a request, one per request, in request order.
+const REPLIES = new Set(["accepted", "board", "relabeled", "claim_result"]);
 
 /** The declared wake latency in ms, or undefined when wake is off. */
 export function wakeLatency(env: string | undefined): number | undefined {
@@ -35,7 +39,8 @@ export default function (pi: ExtensionAPI) {
 	let adapter: ChildProcess | undefined;
 	let why = "roger adapter is not running"; // why the last adapter is gone
 	const seen = new Set<string>(); // a redelivery after a crash shares its record id
-	const pending: Pending[] = []; // send calls awaiting accepted/error, in order
+	const pending: Pending[] = []; // requests awaiting their reply, in order
+	let me = process.env.ROGER_SESSION ?? ""; // the Address, from the adapter's ready line
 
 	const failAll = (e: Error) => {
 		for (const p of pending.splice(0)) p.fail(e);
@@ -72,7 +77,8 @@ export default function (pi: ExtensionAPI) {
 			} catch {
 				return; // not an adapter event; nothing to correlate it with
 			}
-			if (ev.type === "accepted") pending.shift()?.ok(ev.mail);
+			if (ev.type === "ready") me = ev.session;
+			else if (REPLIES.has(ev.type)) pending.shift()?.ok(ev);
 			else if (ev.type === "error") pending.shift()?.fail(new Error(ev.error));
 			else if (ev.type === "mail" && !seen.has(ev.record)) {
 				seen.add(ev.record);
@@ -92,12 +98,14 @@ export default function (pi: ExtensionAPI) {
 		});
 	};
 
-	const send = (to: string, body: string) =>
-		new Promise<string>((ok, fail) => {
+	// One request line to the adapter; replies come back in request order.
+	const request = (req: Reply) =>
+		new Promise<Reply>((ok, fail) => {
 			if (!adapter?.stdin?.writable) return fail(new Error(why));
 			pending.push({ ok, fail });
-			adapter.stdin.write(JSON.stringify({ type: "send", to, body }) + "\n");
+			adapter.stdin.write(JSON.stringify(req) + "\n");
 		});
+	const send = async (to: string, body: string) => (await request({ type: "send", to, body })).mail as string;
 
 	pi.on("session_start", async () => start());
 	pi.on("session_shutdown", async () => {
@@ -114,6 +122,8 @@ export default function (pi: ExtensionAPI) {
 			child.stdin?.end();
 		});
 	});
+
+	registerRogerCommand(pi, { me: () => me, request, send });
 
 	pi.registerCommand("roger-send", {
 		description: "Send Mail: /roger-send <address> <body>",

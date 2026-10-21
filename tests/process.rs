@@ -1273,3 +1273,76 @@ fn declared_text_reaches_the_board_verbatim_and_survives_a_coordinator_restart()
         "{coord}"
     );
 }
+
+/// The Board row's `last_seen_ms` for `session`, read by `reader` (if any).
+fn last_seen(rig: &Rig, reader: Option<&str>) -> i64 {
+    let sock = rig.p("a.sock");
+    let mut args = vec!["board", "--socket", sock.to_str().unwrap()];
+    if let Some(r) = reader {
+        args.extend(["--from", r]);
+    }
+    let output = Command::new(BIN).args(&args).output().unwrap();
+    assert!(output.status.success(), "board failed: {output:?}");
+    let out = String::from_utf8_lossy(&output.stdout).to_string();
+    let line = out
+        .lines()
+        .find(|l| l.starts_with(&format!("SESSION address={RECIPIENT} ")))
+        .unwrap_or_else(|| panic!("no row for {RECIPIENT}: {out}"));
+    let field = line
+        .split(' ')
+        .find_map(|w| w.strip_prefix("last_seen_ms="))
+        .unwrap_or_else(|| panic!("no last_seen_ms: {line}"));
+    field.parse().unwrap()
+}
+
+#[test]
+fn presence_follows_a_sessions_own_activity_and_nothing_else() {
+    let mut rig = Rig::new("presence");
+    rig.start_stack();
+    rig.start_recipient("recipient.out", false);
+
+    // Register sets it.
+    let registered = last_seen(&rig, None);
+    assert!(registered > 0, "register must set last_seen_ms");
+
+    // Nothing refreshes it on a clock: an anonymous read, after a pause, sees
+    // the same value.
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(last_seen(&rig, None), registered);
+
+    // A Board read naming the session is its own activity.
+    let read_at = last_seen(&rig, Some(RECIPIENT));
+    assert!(read_at > registered, "{read_at} > {registered}");
+
+    // A send from it, then an ack by it, each move it forward.
+    std::thread::sleep(Duration::from_millis(5));
+    let sent = Command::new(BIN)
+        .args([
+            "send",
+            "--socket",
+            rig.p("a.sock").to_str().unwrap(),
+            "--from",
+            RECIPIENT,
+            "--to",
+            SENDER,
+            "--mail",
+            "m-presence-1",
+            "--body",
+            "out",
+        ])
+        .output()
+        .unwrap();
+    assert!(sent.status.success(), "{sent:?}");
+    let after_send = last_seen(&rig, None);
+    assert!(after_send > read_at, "{after_send} > {read_at}");
+
+    std::thread::sleep(Duration::from_millis(5));
+    rig.send("m-presence-2", "in");
+    wait_for_text(
+        &rig.p("recipient.out"),
+        "DELIVERED mail=m-presence-2",
+        Duration::from_secs(10),
+    );
+    let after_ack = last_seen(&rig, None);
+    assert!(after_ack > after_send, "{after_ack} > {after_send}");
+}

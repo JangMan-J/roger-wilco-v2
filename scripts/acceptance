@@ -224,6 +224,32 @@ pi_call() {
 
 pi_slash() { pi_call slash "$(jq -cn --arg m "$1" '{type:"prompt",message:$m}')"; }
 
+# A slash command whose handler asks the UI: pi_slash_ui <message> starts it
+# without waiting; pi_ui answers its dialogs; pi_answered waits for the end.
+pi_ui_cmd=""
+pi_slash_ui() {
+  pi_ui_cmd="ui-$RANDOM$RANDOM"
+  jq -cn --arg id "$pi_ui_cmd" --arg m "$1" '{id:$id,type:"prompt",message:$m}' >&3
+}
+pi_answered() { wait_for 10 "Pi answered $pi_ui_cmd" grep -q "\"id\":\"$pi_ui_cmd\",\"type\":\"response\"" "$pi_out"; }
+# pi_ui <method> <jq object of response fields>: answer the oldest unanswered
+# extension_ui_request of <method>.
+pi_ui() {
+  local method="$1" fields="$2" id deadline=$(( $(date +%s) + 10 ))
+  touch "$work/ui.answered"
+  while (( $(date +%s) < deadline )); do
+    id="$(jq -rR --arg m "$method" 'fromjson? | select(.type == "extension_ui_request" and .method == $m) | .id' "$pi_out" \
+      | grep -vxF -f "$work/ui.answered" | head -n1 || true)"
+    if [[ -n "$id" ]]; then
+      echo "$id" >>"$work/ui.answered"
+      jq -cn --arg id "$id" "{type:\"extension_ui_response\",id:\$id} + $fields" >&3
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "no $method dialog from Pi"
+}
+
 pi_transcript_has() {
   pi_call msgs '{"type":"get_messages"}' || return 1
   grep '"command":"get_messages"' "$pi_out" | grep -qF "$1"
@@ -364,9 +390,54 @@ pi_shim() {
   pi_slash "/call-roger-send $RECIPIENT tool body [[153:Meteor Shower:7]]" || fail "Pi did not answer /call-roger-send"
   wait_for 15 "tracer received the tool's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
   log_count "tool body [[153:Meteor Shower:7]]" 1 "$work/tracer.store" || fail "tracer Store must hold the tool's body once"
+
+  # /roger in the same real Pi runtime: label, board, and messaging by
+  # address prefix and by label. ctx.ui.notify text lands in Pi's rpc output.
+  pi_slash "/roger label [[0:FLEET:0]] pi" || fail "Pi did not answer /roger label"
+  wait_for 10 "own label confirmed" grep -qF "$SENDER is now [[0:FLEET:0]] pi" "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "board does not show the label set by /roger label: $("$bin" board --socket "$work/a.sock")"
+  pi_slash "/roger label $RECIPIENT Tracer" || fail "Pi did not answer /roger label <address>"
+  wait_for 10 "tracer label confirmed" grep -qF "$RECIPIENT is now Tracer" "$work/tool.out"
+  # /roger with no args: the Board, then the picker. Pick the tracer, choose
+  # "Set label…", and type a new label; the Board shows it.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"22222222-2222-4222-8222-222222222222 — host host-b — Tracer"}'
+  pi_ui select '{value:"Set label…"}'
+  pi_ui input '{value:"Picked"}'
+  pi_answered
+  wait_for 10 "picker relabel on the Board" sh -c "'$bin' board --socket '$work/b.sock' | grep -q '^SESSION address=$RECIPIENT .* label=Picked\$'"
+  grep -qF "Recent sessions (seen within 600s) (2)" "$work/tool.out" || fail "/roger board lacks the recent heading"
+  grep -qF "Your host: host-a" "$work/tool.out" || fail "/roger board lacks the own host"
+  grep -qF "$RECIPIENT — host host-b — Tracer" "$work/tool.out" || fail "/roger board lacks the tracer row with its label"
+  grep -qF "$SENDER (you) — host host-a — [[0:FLEET:0]] pi" "$work/tool.out" || fail "/roger board lacks the own row"
+  pi_slash "/roger label $RECIPIENT Tracer" || fail "Pi did not answer /roger label <address>"
+  pi_slash "/roger ${RECIPIENT:0:8} by prefix [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger <prefix>"
+  wait_for 15 "prefix-addressed mail stored" log_count "by prefix [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  pi_slash "/roger Tracer by label [[0:FLEET:0]]" || fail "Pi did not answer /roger <label>"
+  wait_for 15 "label-addressed mail stored" log_count "by label [[0:FLEET:0]]" 1 "$work/tracer.store"
+  pi_slash "/roger [[0:FLEET:0]] pi by spaced label" || fail "Pi did not answer /roger <label with spaces>"
+  wait_for 15 "spaced-label mail stored" log_count "by spaced label" 1 "$work/tool.store"
+  pi_slash "/roger * broadcast [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger *"
+  wait_for 15 "broadcast stored by the tracer" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  wait_for 15 "broadcast stored by Pi" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tool.store"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  wait_for 10 "board all rendered" grep -qF "All registered sessions (2)" "$work/tool.out"
+  pi_slash '/call-roger-tool roger_claim {"key":"[[0:build:0]]","ttl_seconds":60}' || fail "Pi did not answer roger_claim"
+  wait_for 10 "roger_claim granted" grep -qF '"ok\":true' "$work/tool.out"
+  "$bin" board --socket "$work/b.sock" | grep -qF "CLAIM holder=$SENDER " || fail "board lacks the claim taken by roger_claim"
+  pi_slash '/call-roger-tool roger_release {"key":"[[0:build:0]]"}' || fail "Pi did not answer roger_release"
+  wait_for 10 "claim released" sh -c "'$bin' board --socket '$work/b.sock' | grep -q 'claims=0'"
+  pi_slash "/roger zzzz nope" || fail "Pi did not answer /roger <unknown>"
+  wait_for 10 "unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  pi_slash "/call-roger-board" || fail "Pi did not answer /call-roger-board"
+  wait_for 10 "roger_board tool answered" grep -qF '\"label\":\"Tracer\"' "$work/tool.out"
+  grep -qF '\"last_seen_ms\":' "$work/tool.out" || fail "roger_board rows lack last_seen_ms"
   pi_stop
 
-  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered"
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label, board (recent and all, with last seen), address-prefix, label and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
 }
 
 # Proof 4. Two hosts, one coordinator. A on decent-spider and B on agent-jail
@@ -499,10 +570,10 @@ references() {
   log_count "$body" 1 "$work/tracer.store" || fail "recipient Store must hold the body once"
 
   # Board: both hosts read both labels byte-identical. The Board read is
-  # proof 4's `roger board`, one `SESSION address=<a> host=<h> label=<l>` line
+  # proof 4's `roger board`, one `SESSION address=<a> host=<h> last_seen_ms=<ms> label=<l>` line
   # per registered session; the label is the rest of the line after `label=`.
   board_label() { # board_label <socket> <address>: the label the Board shows
-    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* label=//p"
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* last_seen_ms=[0-9]* label=//p"
   }
   board_host() { # board_host <socket> <address>
     "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=\([^ ]*\) .*/\1/p"

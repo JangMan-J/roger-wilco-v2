@@ -90,7 +90,10 @@ fn main() -> io::Result<()> {
             }
             Ok(())
         }
-        "board" => session::board(PathBuf::from(need(&args, "--socket")?)),
+        "board" => session::board(
+            PathBuf::from(need(&args, "--socket")?),
+            arg(&args, "--from"),
+        ),
         "label" => session::relabel(
             PathBuf::from(need(&args, "--socket")?),
             need(&args, "--from")?,
