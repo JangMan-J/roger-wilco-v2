@@ -221,31 +221,47 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let mail = net::field(&v, "mail")?.to_string();
                 let session = net::field(&v, "session")?.to_string();
                 let record = net::field(&v, "record")?.to_string();
-                {
+                let known = {
                     let mut st = state.lock().unwrap();
-                    let needs = st.mails.get(&mail).map(|m| !m.acked).unwrap_or(false);
-                    if needs {
-                        let ev = obj(vec![
-                            ("ev", s("receipt")),
-                            ("mail", s(&mail)),
-                            ("session", s(&session)),
-                            ("record", s(&record)),
-                        ]);
-                        st.log.append(&json::stringify(&ev))?;
-                        if let Some(m) = st.mails.get_mut(&mail) {
-                            m.acked = true;
+                    match st.mails.get(&mail) {
+                        None => None,
+                        Some(m) => {
+                            let already = m.acked;
+                            if !already {
+                                let ev = obj(vec![
+                                    ("ev", s("receipt")),
+                                    ("mail", s(&mail)),
+                                    ("session", s(&session)),
+                                    ("record", s(&record)),
+                                ]);
+                                st.log.append(&json::stringify(&ev))?;
+                                if let Some(m) = st.mails.get_mut(&mail) {
+                                    m.acked = true;
+                                }
+                            }
+                            Some(already)
                         }
                     }
-                }
-                net::send(
-                    &writer,
-                    &obj(vec![
+                };
+                // Answering `acked` for a mail this coordinator never accepted
+                // would be a false confirmation: the host daemon trims that
+                // receipt from its replay list on the answer, and the receipt
+                // would never be stored upstream.
+                let reply = match known {
+                    Some(_) => obj(vec![
                         ("type", s("acked")),
                         ("req", Value::Int(req)),
                         ("mail", s(&mail)),
                         ("record", s(&record)),
                     ]),
-                )?;
+                    None => obj(vec![
+                        ("type", s("error")),
+                        ("req", Value::Int(req)),
+                        ("mail", s(&mail)),
+                        ("reason", s("unknown mail")),
+                    ]),
+                };
+                net::send(&writer, &reply)?;
             }
             other => {
                 return Err(io::Error::new(

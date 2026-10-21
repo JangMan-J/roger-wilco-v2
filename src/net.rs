@@ -6,6 +6,17 @@ use std::sync::{Arc, Mutex};
 
 pub type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// The one shape a host daemon uses to forward a receipt upstream, both on
+/// the ack itself and when replaying receipts after a reconnect.
+pub fn ack_msg(mail: &str, session: &str, record: &str) -> Value {
+    obj(vec![
+        ("type", s("ack")),
+        ("mail", s(mail)),
+        ("session", s(session)),
+        ("record", s(record)),
+    ])
+}
+
 /// The one shape both the coordinator and a host daemon use to hand a Mail
 /// to the next hop.
 pub fn deliver_msg(mail: &str, from: &str, to: &str, body: &str) -> Value {

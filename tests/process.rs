@@ -16,6 +16,7 @@ struct Rig {
     dir: PathBuf,
     children: Vec<Child>,
     coord_port: String,
+    coord_idx: usize,
 }
 
 impl Rig {
@@ -30,6 +31,7 @@ impl Rig {
             dir,
             children: Vec::new(),
             coord_port: String::new(),
+            coord_idx: 0,
         }
     }
 
@@ -51,22 +53,27 @@ impl Rig {
         self.children.len() - 1
     }
 
+    /// The coordinator argv, shared by the first start and every restart so a
+    /// flag change cannot reach one and miss the other.
+    fn coordinator_args(&self, bind: &str, port_file: &Path, data: &Path) -> Vec<String> {
+        vec![
+            "coordinator".into(),
+            "--bind".into(),
+            bind.into(),
+            "--port-file".into(),
+            port_file.to_str().unwrap().into(),
+            "--data".into(),
+            data.to_str().unwrap().into(),
+            "--token".into(),
+            TOKEN.into(),
+        ]
+    }
+
     fn start_stack(&mut self) {
         let port_file = self.p("coord.port");
-        self.spawn(
-            &[
-                "coordinator",
-                "--bind",
-                "127.0.0.1:0",
-                "--port-file",
-                port_file.to_str().unwrap(),
-                "--data",
-                self.p("coord.log").to_str().unwrap(),
-                "--token",
-                TOKEN,
-            ],
-            "coord.out",
-        );
+        let args = self.coordinator_args("127.0.0.1:0", &port_file, &self.p("coord.log"));
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        self.spawn(&arg_refs, "coord.out");
         wait_for_file(&port_file, Duration::from_secs(10));
         let port = fs::read_to_string(&port_file).unwrap().trim().to_string();
         self.coord_port = port.clone();
@@ -149,39 +156,37 @@ impl Rig {
     /// Restart the coordinator on the same port, replaying the same data
     /// file, so the host daemon's retry finds it again.
     fn restart_coordinator(&mut self) {
-        self.kill(0);
+        self.restart_coordinator_on("coord.log", "coord2");
+    }
+
+    /// Restart the coordinator on the same port, replaying `data`. A different
+    /// data file gives a coordinator that does not know the mail this host has
+    /// already received.
+    fn restart_coordinator_on(&mut self, data: &str, tag: &str) {
+        self.kill(self.coord_idx);
         let bind = format!("127.0.0.1:{}", self.coord_port);
-        let port_file = self.p("coord2.port");
+        let port_file = self.p(&format!("{tag}.port"));
         let start = Instant::now();
         let mut attempt = 0;
         loop {
             attempt += 1;
             let _ = fs::remove_file(&port_file);
-            let args: Vec<String> = vec![
-                "coordinator".into(),
-                "--bind".into(),
-                bind.clone(),
-                "--port-file".into(),
-                port_file.to_str().unwrap().into(),
-                "--data".into(),
-                self.p("coord.log").to_str().unwrap().into(),
-                "--token".into(),
-                TOKEN.into(),
-            ];
+            let args = self.coordinator_args(&bind, &port_file, &self.p(data));
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
             // A file per attempt: overwriting one name would hide the earlier
             // failures the panic message is supposed to report.
-            let out = format!("coord2-{attempt}.out");
+            let out = format!("{tag}-{attempt}.out");
             let idx = self.spawn(&arg_refs, &out);
             let deadline = Instant::now() + Duration::from_millis(1500);
             while Instant::now() < deadline {
                 if port_file.exists() {
+                    self.coord_idx = idx;
                     return;
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
             self.kill(idx);
-            let err = read(&self.p(&format!("coord2-{attempt}.out.err")));
+            let err = read(&self.p(&format!("{tag}-{attempt}.out.err")));
             // Only a port still held by the killed process is worth retrying;
             // any other exit is a hard failure and must not be masked.
             if !err.contains("Address already in use") {
@@ -309,6 +314,63 @@ fn receipt_survives_a_host_daemon_restart() {
         assert!(rows <= 1, "receipt duplicated: {coord}");
         if start.elapsed() > Duration::from_secs(20) {
             panic!("a receipt committed before the daemon restart never reached the coordinator: {coord}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
+fn receipt_survives_an_upstream_that_never_accepted_the_mail() {
+    let mut rig = Rig::new("orphan-upstream");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+
+    rig.send("m-orphan", "acked before upstream loses the mail");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+
+    // Coordinator down, so the receipt is committed locally only.
+    rig.kill(0);
+    rig.kill(recipient);
+    rig.start_recipient("recipient2.out", true);
+    wait_for_text(
+        &rig.p("b.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-orphan\"",
+        Duration::from_secs(10),
+    );
+
+    // A coordinator with an empty store never accepted m-orphan, so it cannot
+    // record a receipt for it. Its refusal must not be read as confirmation:
+    // the receipt has to stay queued on this host.
+    rig.restart_coordinator_on("coord-empty.log", "coord3");
+    // Wait on the refusal itself, not on the line printed before the replay is
+    // sent: waiting earlier lets the next restart win the race, and the test
+    // passes whether or not the refusal was ever processed.
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        "upstream refused the replayed receipt for m-orphan",
+        Duration::from_secs(15),
+    );
+    let empty = read(&rig.p("coord-empty.log"));
+    assert_eq!(
+        count_lines_with(&empty, "\"ev\":\"receipt\""),
+        0,
+        "a coordinator that never accepted the mail cannot hold a receipt: {empty}"
+    );
+
+    // The coordinator that did accept it comes back, and the same receipt must
+    // still be queued to reach it.
+    rig.restart_coordinator_on("coord.log", "coord4");
+    let start = Instant::now();
+    loop {
+        let coord = read(&rig.p("coord.log"));
+        let rows = count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-orphan\"");
+        if rows == 1 {
+            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+            return;
+        }
+        assert!(rows <= 1, "receipt duplicated: {coord}");
+        if start.elapsed() > Duration::from_secs(20) {
+            panic!("a refusal from one coordinator dropped the receipt for the next: {coord}");
         }
         std::thread::sleep(Duration::from_millis(50));
     }

@@ -194,16 +194,11 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
     }
     // A receipt committed while upstream was down still has to arrive. The
     // coordinator's acked answers trim `receipts` in the loop below.
+    if !receipts.is_empty() {
+        eprintln!("upstream connected, replaying {} receipts", receipts.len());
+    }
     for r in &receipts {
-        let _ = net::send(
-            &writer,
-            &obj(vec![
-                ("type", s("ack")),
-                ("mail", s(&r.mail)),
-                ("session", s(&r.session)),
-                ("record", s(&r.record)),
-            ]),
-        );
+        let _ = net::send(&writer, &net::ack_msg(&r.mail, &r.session, &r.record));
     }
     for line in lines {
         let v = line?;
@@ -223,7 +218,23 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
                     state.lock().unwrap().receipts.retain(|r| r.mail != mail);
                 }
             }
-            "accepted" | "error" => {
+            "error" => {
+                let waiter = v
+                    .get("req")
+                    .and_then(|x| x.as_i64())
+                    .and_then(|req| state.lock().unwrap().waiters.remove(&req));
+                if let Some(tx) = waiter {
+                    let _ = tx.send(v.clone());
+                } else if let Ok(mail) = net::field(&v, "mail") {
+                    // A replayed receipt upstream refuses stays queued, so say
+                    // so: silence here would look like a confirmed receipt.
+                    eprintln!(
+                        "upstream refused the replayed receipt for {mail}: {}",
+                        net::field(&v, "reason").unwrap_or("unexplained")
+                    );
+                }
+            }
+            "accepted" => {
                 if let Some(req) = v.get("req").and_then(|x| x.as_i64()) {
                     let waiter = state.lock().unwrap().waiters.remove(&req);
                     if let Some(tx) = waiter {
@@ -412,16 +423,18 @@ fn local_loop(
                 // already durable in this host daemon, which is core, so the
                 // session is answered now and the receipt is replayed after
                 // the next hello_ok if this forward fails.
-                if let Err(e) = upstream_request(
-                    state,
-                    obj(vec![
-                        ("type", s("ack")),
-                        ("mail", s(&mail)),
-                        ("session", s(&session)),
-                        ("record", s(&record)),
-                    ]),
-                ) {
-                    eprintln!("receipt {mail} committed, upstream forward deferred: {e}");
+                match upstream_request(state, net::ack_msg(&mail, &session, &record)) {
+                    Err(e) => {
+                        eprintln!("receipt {mail} committed, upstream forward deferred: {e}")
+                    }
+                    // A refusal means upstream never accepted that mail, so the
+                    // receipt stays queued and is replayed after the next
+                    // hello_ok rather than being treated as confirmed.
+                    Ok(resp) if net::field(&resp, "type").unwrap_or("") == "error" => eprintln!(
+                        "receipt {mail} committed, upstream refused it: {}",
+                        net::field(&resp, "reason").unwrap_or("unexplained")
+                    ),
+                    Ok(_) => {}
                 }
                 net::send(
                     writer,
