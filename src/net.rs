@@ -1,10 +1,22 @@
 //! Line-delimited JSON over any byte stream. One object per line.
 
-use crate::json::{self, Value};
+use crate::json::{self, obj, s, Value};
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::sync::{Arc, Mutex};
 
 pub type Writer = Arc<Mutex<Box<dyn Write + Send>>>;
+
+/// The one shape both the coordinator and a host daemon use to hand a Mail
+/// to the next hop.
+pub fn deliver_msg(mail: &str, from: &str, to: &str, body: &str) -> Value {
+    obj(vec![
+        ("type", s("deliver")),
+        ("mail", s(mail)),
+        ("from", s(from)),
+        ("to", s(to)),
+        ("body", s(body)),
+    ])
+}
 
 pub fn writer(w: Box<dyn Write + Send>) -> Writer {
     Arc::new(Mutex::new(w))

@@ -20,7 +20,10 @@ struct Rig {
 
 impl Rig {
     fn new(tag: &str) -> Rig {
-        let dir = std::env::temp_dir().join(format!("roger-process-{}-{tag}", std::process::id()));
+        // No PID in the name: Rig::new clears the directory, so each tag owns
+        // one directory and a failing run's logs survive until the next run of
+        // that tag instead of being deleted on drop.
+        let dir = std::env::temp_dir().join(format!("roger-process-{tag}"));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Rig {
@@ -150,7 +153,9 @@ impl Rig {
         let bind = format!("127.0.0.1:{}", self.coord_port);
         let port_file = self.p("coord2.port");
         let start = Instant::now();
+        let mut attempt = 0;
         loop {
+            attempt += 1;
             let _ = fs::remove_file(&port_file);
             let args: Vec<String> = vec![
                 "coordinator".into(),
@@ -164,7 +169,10 @@ impl Rig {
                 TOKEN.into(),
             ];
             let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-            let idx = self.spawn(&arg_refs, "coord2.out");
+            // A file per attempt: overwriting one name would hide the earlier
+            // failures the panic message is supposed to report.
+            let out = format!("coord2-{attempt}.out");
+            let idx = self.spawn(&arg_refs, &out);
             let deadline = Instant::now() + Duration::from_millis(1500);
             while Instant::now() < deadline {
                 if port_file.exists() {
@@ -172,15 +180,41 @@ impl Rig {
                 }
                 std::thread::sleep(Duration::from_millis(20));
             }
-            // The port may still be held by the process we just killed.
             self.kill(idx);
+            let err = read(&self.p(&format!("coord2-{attempt}.out.err")));
+            // Only a port still held by the killed process is worth retrying;
+            // any other exit is a hard failure and must not be masked.
+            if !err.contains("Address already in use") {
+                panic!("coordinator failed to rebind {bind} on attempt {attempt}: {err}");
+            }
             if start.elapsed() > Duration::from_secs(15) {
-                panic!(
-                    "coordinator never rebound {bind}: {}",
-                    read(&self.p("coord2.out.err"))
-                );
+                panic!("coordinator never rebound {bind}; last attempt: {err}");
             }
         }
+    }
+
+    /// Restart the host daemon that serves the recipient, replaying the same
+    /// data file, so receipts committed to that log are replayed from disk.
+    fn restart_recipient_daemon(&mut self) {
+        self.kill(2);
+        let coord = format!("127.0.0.1:{}", self.coord_port);
+        let args: Vec<String> = vec![
+            "daemon".into(),
+            "--coordinator".into(),
+            coord,
+            "--token".into(),
+            TOKEN.into(),
+            "--host-id".into(),
+            "host-b".into(),
+            "--socket".into(),
+            self.p("b.sock").to_str().unwrap().into(),
+            "--data".into(),
+            self.p("b.log").to_str().unwrap().into(),
+        ];
+        let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+        let _ = fs::remove_file(self.p("b.sock"));
+        self.spawn(&arg_refs, "daemon-b2.out");
+        wait_for_file(&self.p("b.sock"), Duration::from_secs(10));
     }
 }
 
@@ -233,6 +267,48 @@ fn count_lines_with(text: &str, needle: &str) -> usize {
 }
 
 #[test]
+fn receipt_survives_a_host_daemon_restart() {
+    let mut rig = Rig::new("daemon-restart");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+
+    rig.send("m-restart", "acked before the host daemon restarts");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+
+    // Coordinator down, so the ack can only be committed to the host log.
+    rig.kill(0);
+    rig.kill(recipient);
+    rig.start_recipient("recipient2.out", true);
+    wait_for_text(
+        &rig.p("b.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-restart\"",
+        Duration::from_secs(10),
+    );
+
+    // Nothing live may be able to produce the receipt from here on: the
+    // session is gone and the daemon that committed it is replaced by one
+    // whose receipts come only from replaying that log.
+    rig.kill(4);
+    rig.restart_recipient_daemon();
+    rig.restart_coordinator();
+
+    let start = Instant::now();
+    loop {
+        let coord = read(&rig.p("coord.log"));
+        let rows = count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-restart\"");
+        if rows == 1 {
+            assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+            return;
+        }
+        assert!(rows <= 1, "receipt duplicated: {coord}");
+        if start.elapsed() > Duration::from_secs(20) {
+            panic!("a receipt committed before the daemon restart never reached the coordinator: {coord}");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+#[test]
 fn receipt_reaches_the_coordinator_after_it_returns() {
     let mut rig = Rig::new("receipt-late");
     rig.start_stack();
@@ -245,9 +321,19 @@ fn receipt_reaches_the_coordinator_after_it_returns() {
     rig.kill(0);
     rig.kill(recipient);
     rig.start_recipient("recipient2.out", true);
+
+    // Pin the ordering before anything is restarted: the receipt must be
+    // durable in the host daemon's own log, and the session must be answered,
+    // while the coordinator is still down. Without these two waits the rest
+    // of the test could pass through a live forward after the restart.
     wait_for_text(
-        &rig.p("daemon-b.out.err"),
-        "upstream",
+        &rig.p("b.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-late\"",
+        Duration::from_secs(10),
+    );
+    wait_for_text(
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-late record=r-1",
         Duration::from_secs(10),
     );
 
@@ -264,6 +350,15 @@ fn receipt_reaches_the_coordinator_after_it_returns() {
         let coord = read(&rig.p("coord.log"));
         if count_lines_with(&coord, "\"ev\":\"receipt\",\"mail\":\"m-late\"") == 1 {
             assert!(coord.contains("\"record\":\"r-1\""), "{coord}");
+            // The restarted coordinator re-pushes pending mail on hello before
+            // the replayed ack arrives; the body must still be in the Store
+            // exactly once.
+            let store = read(&rig.p("recipient.store"));
+            assert_eq!(
+                store.lines().count(),
+                1,
+                "re-push after the coordinator returned duplicated the body: {store}"
+            );
             return;
         }
         assert!(
