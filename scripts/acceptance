@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence|pi-shim>
+# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -49,14 +49,18 @@ remote_spawn() { # remote_spawn <pid-file-name> <stdout-file> <args...>
   ssh -n "$REMOTE_HOST" "bash -lc 'cd $remote_work; ($args >$out 2>&1 </dev/null & echo \$! > $pid_name) ; exit 0'"
 }
 
-cross_host() {
+# Two-host core shared by the cross-host checks: build, then a coordinator on
+# this host's tailnet address, a host daemon here (decent-spider, $work/a.sock)
+# and one on $REMOTE_HOST (agent-jail, $remote_work/b.sock). Sets globals
+# bin, work, remote_work, coord.
+two_host_stack() {
   command -v tailscale >/dev/null || fail "tailscale CLI required"
   local ts_ip
   ts_ip="$(tailscale ip -4 2>/dev/null | head -n1)"
   [[ -n "$ts_ip" ]] || fail "no tailnet IPv4 on this host"
 
   (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
-  local bin="$ROOT/target/release/roger"
+  bin="$ROOT/target/release/roger"
 
   local token
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
@@ -69,7 +73,7 @@ cross_host() {
     --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
   coord_pid=$!
   wait_for 10 "coordinator port file" test -s "$work/port"
-  local coord="$ts_ip:$(cat "$work/port")"
+  coord="$ts_ip:$(cat "$work/port")"
 
   "$bin" daemon --coordinator "$coord" --token "$token" \
     --host-id decent-spider --socket "$work/a.sock" --data "$work/a.log" \
@@ -87,6 +91,10 @@ cross_host() {
     "./roger daemon --coordinator $coord --token $token --host-id agent-jail --socket $remote_work/b.sock --data $remote_work/b.log" \
     || fail "start remote daemon"
   wait_for 15 "remote daemon socket" ssh -n "$REMOTE_HOST" "test -S $remote_work/b.sock"
+}
+
+cross_host() {
+  two_host_stack
 
   remote_spawn recipient.pid recipient1.out \
     "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
@@ -353,9 +361,72 @@ pi_shim() {
   echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered"
 }
 
+# Proof 4. Two hosts, one coordinator. A on decent-spider and B on agent-jail
+# contend for one key through their own host daemons. Expiry is read from the
+# committed deadline; nothing releases the key and nothing sweeps it.
+CLAIM_KEY="[[0:build:0]]"
+now_ms() { date +%s%3N; }
+local_roger() { "$bin" "$@" --socket "$work/a.sock"; }
+remote_roger() { ssh -n "$REMOTE_HOST" "bash -lc 'cd $remote_work && ./roger $* --socket $remote_work/b.sock'"; }
+
+# expect_claim <want-exit> <want-prefix> <local|remote> <roger args...>
+expect_claim() {
+  local want="$1" prefix="$2" where="$3" out code=0; shift 3
+  out="$("${where}_roger" "$@" --key "$CLAIM_KEY")" || code=$?
+  [[ "$code" == "$want" ]] || fail "$where $1: expected exit $want, saw $code: $out"
+  [[ "$out" == "$prefix"* ]] || fail "$where $1: expected '$prefix...', saw: $out"
+}
+
+# Both hosts' Board shows exactly one claim on the key, held by <owner>.
+board_one_holder() {
+  local owner="$1" where out lines
+  for where in local remote; do
+    out="$("${where}_roger" board)" || fail "$where board read failed"
+    lines="$(grep -F "key=$CLAIM_KEY" <<<"$out" | grep '^CLAIM ' || true)"
+    [[ "$(grep -c . <<<"$lines")" == 1 && "$lines" == "CLAIM holder=$owner "* ]] \
+      || fail "$where board must show one holder $owner, saw: $out"
+  done
+}
+
+key_free_on_board() { ! local_roger board | grep -qF "key=$CLAIM_KEY"; }
+
+claims() {
+  local a="$SENDER" b="$RECIPIENT" t0 tr
+  two_host_stack
+
+  t0="$(now_ms)"
+  expect_claim 0 "CLAIMED op=acquire holder=$a " local claim --owner "$a" --ttl-ms 4000
+  expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
+  expect_claim 3 "REFUSED op=renew holder=$a " remote renew --owner "$b" --ttl-ms 60000
+  board_one_holder "$a"
+
+  tr="$(now_ms)"
+  (( tr < t0 + 4000 )) || fail "too slow: renewal would start after the first deadline"
+  expect_claim 0 "RENEWED op=renew holder=$a " local renew --owner "$a" --ttl-ms 8000
+
+  # Past the first deadline: the renewal holds the key.
+  sleep "$(awk -v ms=$(( t0 + 4500 - $(now_ms) )) 'BEGIN { print (ms > 0 ? ms / 1000 : 0) }')"
+  expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
+  board_one_holder "$a"
+
+  # Past the renewed deadline the key is free: no release, no sweep.
+  wait_for 20 "expiry frees the key" key_free_on_board
+  (( $(now_ms) >= tr + 8000 )) || fail "key freed before the renewed deadline"
+  grep -q '"ev":"release"' "$work/coord.log" && fail "a release event freed the key, not expiry"
+  expect_claim 3 "REFUSED op=renew " local renew --owner "$a" --ttl-ms 8000
+
+  expect_claim 0 "CLAIMED op=acquire holder=$b " remote claim --owner "$b" --ttl-ms 60000
+  expect_claim 3 "REFUSED op=acquire holder=$b " local claim --owner "$a" --ttl-ms 4000
+  board_one_holder "$b"
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS claims: second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from decent-spider and agent-jail showed one holder"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
   independence) independence ;;
   pi-shim) pi_shim ;;
-  *) echo "usage: $0 <cross-host|independence|pi-shim>" >&2; exit 2 ;;
+  claims) claims ;;
+  *) echo "usage: $0 <cross-host|independence|pi-shim|claims>" >&2; exit 2 ;;
 esac

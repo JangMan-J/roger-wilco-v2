@@ -1,3 +1,4 @@
+mod claims;
 mod coordinator;
 mod daemon;
 mod durlog;
@@ -62,6 +63,30 @@ fn main() -> io::Result<()> {
             },
             need(&args, "--body")?,
         ),
+        "claim" | "renew" | "release" => {
+            let op = if cmd == "claim" { "acquire" } else { cmd };
+            let ttl_ms = match arg(&args, "--ttl-ms") {
+                Some(t) => t.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--ttl-ms expects milliseconds, saw {t}"),
+                    )
+                })?,
+                None => 0,
+            };
+            let granted = session::claim(
+                PathBuf::from(need(&args, "--socket")?),
+                op,
+                need(&args, "--owner")?,
+                need(&args, "--key")?,
+                ttl_ms,
+            )?;
+            if !granted {
+                std::process::exit(3);
+            }
+            Ok(())
+        }
+        "board" => session::board(PathBuf::from(need(&args, "--socket")?)),
         _ => {
             eprintln!("usage: roger <coordinator|daemon|session|adapter|send> [flags]");
             std::process::exit(2);

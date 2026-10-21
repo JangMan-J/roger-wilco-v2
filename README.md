@@ -11,9 +11,12 @@ cargo test --offline          # unit seams + process seam (real coordinator, dae
 cargo build --release --offline
 ```
 
-One binary, no external crates. `roger` has five subcommands: `coordinator`,
+One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
-line stream for a shim), `send`. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
+line stream for a shim), `send`, and the claim and Board client: `claim`, `renew`,
+`release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused) and `board`
+(`--socket`; prints `SESSION address= host=`, `CLAIM holder= remaining_ms= key=`,
+`BOARD sessions= claims=`). Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
 ## Checks
@@ -24,6 +27,7 @@ warnings denied, tests, harness-free). Review rules are in `CODING_STANDARDS.md`
 ```sh
 scripts/check                     # the gate
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
+scripts/acceptance claims        # proof 4: claims are exclusive, renew, expire; board on both hosts
 scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
 node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter
 scripts/acceptance independence   # proof 2: Pi and Claude Code sessions (plus a Tracer) exchange mail; loopback
@@ -52,6 +56,7 @@ binaries, then removes every process and directory it created.
 | Path | Role |
 | --- | --- |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
+| `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped agent session (Tracer) and adapter; writes its Store, then acks |
 | `shims/claude/roger-mcp.mjs` | Claude Code shim: `roger_send` and `roger_inbox` MCP tools over the adapter |

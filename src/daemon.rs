@@ -234,7 +234,7 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
                     );
                 }
             }
-            "accepted" => {
+            "accepted" | "claim_result" | "board" => {
                 if let Some(req) = v.get("req").and_then(|x| x.as_i64()) {
                     let waiter = state.lock().unwrap().waiters.remove(&req);
                     if let Some(tx) = waiter {
@@ -445,6 +445,24 @@ fn local_loop(
                         ("record", s(&record)),
                     ]),
                 )?;
+            }
+            // Claims and the Board live only at the coordinator, so the host
+            // daemon relays them and answers under the session's own req.
+            "claim" | "board" => {
+                let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+                let mut upstream = v.clone();
+                if let Value::Obj(pairs) = &mut upstream {
+                    pairs.retain(|(k, _)| k != "req");
+                }
+                let mut resp = upstream_request(state, upstream)?;
+                if let Value::Obj(pairs) = &mut resp {
+                    for (k, val) in pairs.iter_mut() {
+                        if k == "req" {
+                            *val = Value::Int(req);
+                        }
+                    }
+                }
+                net::send(writer, &resp)?;
             }
             other => {
                 return Err(io::Error::new(

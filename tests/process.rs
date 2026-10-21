@@ -746,3 +746,155 @@ fn adapter_redelivery_after_a_kill_reports_the_same_record() {
     let store = read(&rig.p("adapter.store"));
     assert_eq!(count_lines_with(&store, "held body"), 1, "{store}");
 }
+
+const KEY: &str = "[[153:Meteor Shower:7]]";
+
+/// Run one claim-family client command (`claim`, `renew`, `release`) on a
+/// host's daemon socket. Returns the exit code and stdout.
+fn claim_cmd(rig: &Rig, sock: &str, verb: &str, owner: &str, ttl_ms: u64) -> (i32, String) {
+    let output = Command::new(BIN)
+        .args([
+            verb,
+            "--socket",
+            rig.p(sock).to_str().unwrap(),
+            "--owner",
+            owner,
+            "--key",
+            KEY,
+            "--ttl-ms",
+            &ttl_ms.to_string(),
+        ])
+        .output()
+        .unwrap();
+    (
+        output.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
+}
+
+fn board(rig: &Rig, sock: &str) -> String {
+    let output = Command::new(BIN)
+        .args(["board", "--socket", rig.p(sock).to_str().unwrap()])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "board failed: {output:?}");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Both hosts' Board shows exactly one claim on KEY, held by `owner`.
+fn assert_one_holder(rig: &Rig, owner: &str) {
+    for sock in ["a.sock", "b.sock"] {
+        let b = board(rig, sock);
+        let lines: Vec<&str> = b.lines().filter(|l| l.starts_with("CLAIM ")).collect();
+        assert_eq!(lines.len(), 1, "{sock}: {b}");
+        assert!(
+            lines[0].starts_with(&format!("CLAIM holder={owner} ")),
+            "{sock}: {b}"
+        );
+        assert!(lines[0].ends_with(&format!("key={KEY}")), "{sock}: {b}");
+    }
+}
+
+#[test]
+fn claim_is_exclusive_renewed_by_its_owner_and_freed_by_expiry() {
+    let mut rig = Rig::new("claims");
+    rig.start_stack();
+
+    let start = Instant::now();
+    let (code, out) = claim_cmd(&rig, "a.sock", "claim", SENDER, 1500);
+    assert_eq!(code, 0, "{out}");
+    assert!(
+        out.starts_with(&format!("CLAIMED op=acquire holder={SENDER} ")),
+        "{out}"
+    );
+
+    let (code, out) = claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 1500);
+    assert_eq!(code, 3, "{out}");
+    assert!(
+        out.starts_with(&format!("REFUSED op=acquire holder={SENDER} ")),
+        "{out}"
+    );
+    let (code, out) = claim_cmd(&rig, "b.sock", "renew", RECIPIENT, 60_000);
+    assert_eq!(code, 3, "only the holder renews: {out}");
+    assert_one_holder(&rig, SENDER);
+
+    let (code, out) = claim_cmd(&rig, "a.sock", "renew", SENDER, 3000);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("RENEWED "), "{out}");
+
+    // Past the first deadline, the renewal still holds.
+    std::thread::sleep(Duration::from_millis(1700).saturating_sub(start.elapsed()));
+    assert_one_holder(&rig, SENDER);
+    assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 1500).0, 3);
+
+    // Past the renewed deadline the key is free with no release and no sweep.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while board(&rig, "a.sock").contains("CLAIM ") {
+        assert!(Instant::now() < deadline, "claim never expired");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(start.elapsed() >= Duration::from_millis(3000));
+    let (code, out) = claim_cmd(&rig, "a.sock", "renew", SENDER, 3000);
+    assert_eq!(code, 3, "an expired claim cannot be renewed back: {out}");
+    let (code, out) = claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000);
+    assert_eq!(code, 0, "{out}");
+    assert_one_holder(&rig, RECIPIENT);
+
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(count_lines_with(&coord, "\"ev\":\"release\""), 0, "{coord}");
+}
+
+#[test]
+fn release_is_the_holders_and_frees_the_key() {
+    let mut rig = Rig::new("claims-release");
+    rig.start_stack();
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
+    assert_eq!(claim_cmd(&rig, "b.sock", "release", RECIPIENT, 0).0, 3);
+    assert_one_holder(&rig, SENDER);
+    let (code, out) = claim_cmd(&rig, "a.sock", "release", SENDER, 0);
+    assert_eq!(code, 0, "{out}");
+    assert!(out.starts_with("RELEASED "), "{out}");
+    assert!(board(&rig, "b.sock").contains("claims=0"));
+    assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000).0, 0);
+    assert_one_holder(&rig, RECIPIENT);
+}
+
+#[test]
+fn claim_survives_a_coordinator_restart() {
+    let mut rig = Rig::new("claims-restart");
+    rig.start_stack();
+    assert_eq!(claim_cmd(&rig, "a.sock", "claim", SENDER, 60_000).0, 0);
+    rig.restart_coordinator();
+    // Until the host daemon reconnects the request fails outright (exit 1);
+    // the refusal must come from the replayed claim, not from an error.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let (code, out) = loop {
+        let (code, out) = claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000);
+        if code != 1 || Instant::now() > deadline {
+            break (code, out);
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    assert_eq!(code, 3, "{out}");
+    wait_until_board_reaches_both(&rig);
+    assert_one_holder(&rig, SENDER);
+}
+
+fn wait_until_board_reaches_both(rig: &Rig) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    for sock in ["a.sock", "b.sock"] {
+        while !Command::new(BIN)
+            .args(["board", "--socket", rig.p(sock).to_str().unwrap()])
+            .output()
+            .unwrap()
+            .status
+            .success()
+        {
+            assert!(
+                Instant::now() < deadline,
+                "{sock} never reached the coordinator"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}

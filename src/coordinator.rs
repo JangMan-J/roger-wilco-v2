@@ -1,8 +1,10 @@
 //! The coordinator: single central durable store for sessions, mail, and
 //! receipts. Host daemons connect to it; committed mail is pushed to the
 //! recipient's host daemon, and pending mail is pushed when a session or
-//! host (re)registers. Nothing here scans on a timer.
+//! host (re)registers. Claims are decided against their committed deadlines
+//! at the moment of each request or board read. Nothing here scans on a timer.
 
+use crate::claims::{Change, Claims, Held, Op};
 use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net::{self, Writer};
@@ -27,6 +29,16 @@ struct State {
     order: Vec<String>,
     hosts: HashMap<String, (u64, Writer)>, // host -> (connection id, live connection)
     next_conn: u64,
+    claims: Claims,
+}
+
+/// Coordinator wall clock in milliseconds since the Unix epoch: the one clock
+/// every claim deadline is set and read against, whichever host asks.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
 }
 
 pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String) -> io::Result<()> {
@@ -38,6 +50,7 @@ pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String)
         order: Vec::new(),
         hosts: HashMap::new(),
         next_conn: 1,
+        claims: Claims::default(),
     };
     for line in &prior {
         if let Ok(v) = json::parse(line) {
@@ -96,6 +109,24 @@ fn apply(state: &mut State, v: &Value) {
                 if let Some(m) = state.mails.get_mut(mail) {
                     m.acked = true;
                 }
+            }
+        }
+        Some("claim") => {
+            if let (Ok(key), Ok(owner), Some(expires_ms)) = (
+                net::field(v, "key"),
+                net::field(v, "owner"),
+                v.get("expires_ms").and_then(|x| x.as_i64()),
+            ) {
+                let change = Change::Grant {
+                    owner: owner.to_string(),
+                    expires_ms,
+                };
+                state.claims.apply(key, &change);
+            }
+        }
+        Some("release") => {
+            if let Ok(key) = net::field(v, "key") {
+                state.claims.apply(key, &Change::Release);
             }
         }
         _ => {}
@@ -263,6 +294,20 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 };
                 net::send(&writer, &reply)?;
             }
+            "claim" => {
+                let reply = {
+                    let mut st = state.lock().unwrap();
+                    claim(&mut st, &v)?
+                };
+                net::send(&writer, &reply)?;
+            }
+            "board" => {
+                let reply = {
+                    let st = state.lock().unwrap();
+                    board(&st, &v)
+                };
+                net::send(&writer, &reply)?;
+            }
             other => {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -279,4 +324,94 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
         st.hosts.remove(&host);
     }
     Ok(())
+}
+
+fn holder_fields(pairs: &mut Vec<(&str, Value)>, holder: Option<&Held>, now: i64) {
+    if let Some(h) = holder {
+        pairs.push(("holder", s(&h.owner)));
+        pairs.push(("remaining_ms", Value::Int(h.expires_ms - now)));
+    }
+}
+
+/// Decide one claim request, commit its change durably, then answer. The lock
+/// is held throughout, so two owners racing for one key see one order.
+fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
+    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+    let op_name = net::field(v, "op")?;
+    let op = Op::parse(op_name).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected op acquire, renew, or release; saw {op_name}"),
+        )
+    })?;
+    let key = net::field(v, "key")?.to_string();
+    let owner = net::field(v, "owner")?.to_string();
+    let ttl_ms = v.get("ttl_ms").and_then(|x| x.as_i64()).unwrap_or(0);
+    if op != Op::Release && ttl_ms <= 0 {
+        return Ok(obj(vec![
+            ("type", s("error")),
+            ("req", Value::Int(req)),
+            (
+                "reason",
+                s(&format!("ttl_ms must be positive, saw {ttl_ms}")),
+            ),
+        ]));
+    }
+    let now = now_ms();
+    let d = st.claims.decide(&op, &key, &owner, ttl_ms, now);
+    if let Some(change) = &d.change {
+        let ev = match change {
+            Change::Grant { owner, expires_ms } => obj(vec![
+                ("ev", s("claim")),
+                ("key", s(&key)),
+                ("owner", s(owner)),
+                ("expires_ms", Value::Int(*expires_ms)),
+            ]),
+            Change::Release => obj(vec![
+                ("ev", s("release")),
+                ("key", s(&key)),
+                ("owner", s(&owner)),
+            ]),
+        };
+        st.log.append(&json::stringify(&ev))?;
+        st.claims.apply(&key, change);
+    }
+    let mut pairs = vec![
+        ("type", s("claim_result")),
+        ("req", Value::Int(req)),
+        ("op", s(op.name())),
+        ("key", s(&key)),
+        ("ok", Value::Bool(d.ok)),
+    ];
+    holder_fields(&mut pairs, d.holder.as_ref(), now);
+    Ok(obj(pairs))
+}
+
+/// The Board: registered sessions and every claim live at the moment of the
+/// read.
+fn board(st: &State, v: &Value) -> Value {
+    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+    let now = now_ms();
+    let mut sessions: Vec<(&String, &String)> = st.sessions.iter().collect();
+    sessions.sort();
+    let sessions = sessions
+        .into_iter()
+        .map(|(session, host)| obj(vec![("session", s(session)), ("host", s(host))]))
+        .collect();
+    let claims = st
+        .claims
+        .active(now)
+        .into_iter()
+        .map(|(key, h)| {
+            let mut pairs = vec![("key", s(key))];
+            holder_fields(&mut pairs, Some(h), now);
+            obj(pairs)
+        })
+        .collect();
+    obj(vec![
+        ("type", s("board")),
+        ("req", Value::Int(req)),
+        ("sessions", Value::Arr(sessions)),
+        ("claims", Value::Arr(claims)),
+    ])
 }

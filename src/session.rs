@@ -227,6 +227,91 @@ fn send_mail(socket: &PathBuf, from: &str, to: &str, mail: &str, body: &str) -> 
     Err(io::Error::new(io::ErrorKind::UnexpectedEof, "no accepted"))
 }
 
+/// One request to the host daemon, answered by exactly one line.
+fn request(socket: &PathBuf, v: &Value) -> io::Result<Value> {
+    let conn = UnixStream::connect(socket)?;
+    let writer = net::writer(Box::new(conn.try_clone()?));
+    net::send(&writer, v)?;
+    let reply = net::lines(Box::new(conn))
+        .next()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "no answer"))??;
+    if net::field(&reply, "type")? == "error" {
+        return Err(io::Error::other(
+            net::field(&reply, "reason")
+                .unwrap_or("unexplained")
+                .to_string(),
+        ));
+    }
+    Ok(reply)
+}
+
+fn holder_text(v: &Value) -> String {
+    match (
+        net::field(v, "holder"),
+        v.get("remaining_ms").and_then(|x| x.as_i64()),
+    ) {
+        (Ok(h), Some(r)) => format!("holder={h} remaining_ms={r} "),
+        _ => String::new(),
+    }
+}
+
+/// The client: one claim operation (`acquire`, `renew`, or `release`) for
+/// `owner` on `key`. Prints the outcome; returns false when refused.
+pub fn claim(
+    socket: PathBuf,
+    op: &str,
+    owner: String,
+    key: String,
+    ttl_ms: i64,
+) -> io::Result<bool> {
+    let reply = request(
+        &socket,
+        &obj(vec![
+            ("type", s("claim")),
+            ("req", Value::Int(1)),
+            ("op", s(op)),
+            ("key", s(&key)),
+            ("owner", s(&owner)),
+            ("ttl_ms", Value::Int(ttl_ms)),
+        ]),
+    )?;
+    let ok = matches!(reply.get("ok"), Some(Value::Bool(true)));
+    let word = match (ok, op) {
+        (false, _) => "REFUSED",
+        (true, "acquire") => "CLAIMED",
+        (true, "renew") => "RENEWED",
+        (true, _) => "RELEASED",
+    };
+    println!("{word} op={op} {}key={key}", holder_text(&reply));
+    Ok(ok)
+}
+
+/// The client: one Board read, one line per registered session and per live
+/// claim.
+pub fn board(socket: PathBuf) -> io::Result<()> {
+    let reply = request(
+        &socket,
+        &obj(vec![("type", s("board")), ("req", Value::Int(1))]),
+    )?;
+    let list = |name: &str| match reply.get(name) {
+        Some(Value::Arr(items)) => items.clone(),
+        _ => Vec::new(),
+    };
+    let (sessions, claims) = (list("sessions"), list("claims"));
+    for v in &sessions {
+        println!(
+            "SESSION address={} host={}",
+            net::field(v, "session")?,
+            net::field(v, "host")?
+        );
+    }
+    for v in &claims {
+        println!("CLAIM {}key={}", holder_text(v), net::field(v, "key")?);
+    }
+    println!("BOARD sessions={} claims={}", sessions.len(), claims.len());
+    Ok(())
+}
+
 pub fn gen_uuid() -> io::Result<String> {
     let mut b = [0u8; 16];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut b)?;
