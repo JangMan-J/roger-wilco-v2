@@ -13,4 +13,5 @@ step cargo test --offline
 step scripts/check-harness-free
 step scripts/check-no-poll
 step node --test shims/pi/test/roger-target.test.ts
+step node --test shims/claude
 echo "PASS check"
