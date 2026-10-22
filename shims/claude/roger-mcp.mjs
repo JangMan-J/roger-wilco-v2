@@ -12,28 +12,49 @@
 // within ROGER_PRESENCE_WINDOW_MS (default 10 minutes); {all: true} skips the
 // filter. Board rows pass through verbatim.
 //
-// Env: ROGER_SOCKET, ROGER_STORE (required), ROGER_SESSION (Address), ROGER_BIN,
-// ROGER_DECLARE (opaque text the session states about itself at Register,
-// passed verbatim as `--declare`; unset declares nothing). This shim cannot
-// start a turn, so it never declares a wake latency.
+// Env (an explicit, non-empty value always wins):
+//   ROGER_SESSION  the Address; default Claude Code's own session id
+//                  (CLAUDE_CODE_SESSION_ID, which Claude Code sets for its MCP
+//                  stdio children) when it is a UUID, else a fresh randomUUID.
+//                  The session id survives `--resume`, so a resumed session
+//                  keeps its Address and its Store.
+//   ROGER_SOCKET   default $XDG_RUNTIME_DIR/roger/daemon.sock
+//   ROGER_BIN      default ~/.local/bin/roger when it exists, else `roger`
+//   ROGER_STORE    default ${XDG_STATE_HOME:-~/.local/state}/roger-shims/claude/<address>.store:
+//                  the shim's state lives in the shim's own directory.
+//   ROGER_DECLARE  opaque text the session states about itself at Register,
+//                  passed verbatim as `--declare`; unset declares nothing. This
+//                  shim cannot start a turn, so it never declares a wake latency.
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { existsSync, mkdirSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
 
-const socket = process.env.ROGER_SOCKET;
-const store = process.env.ROGER_STORE;
-if (!socket || !store) {
-	console.error("ROGER_SOCKET and ROGER_STORE are required");
+const env = (k) => process.env[k] || undefined; // empty counts as unset
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const harnessId = env("CLAUDE_CODE_SESSION_ID");
+const session = env("ROGER_SESSION") ?? (harnessId && UUID.test(harnessId) ? harnessId : randomUUID());
+const runtime = env("XDG_RUNTIME_DIR");
+const socket = env("ROGER_SOCKET") ?? (runtime && join(runtime, "roger", "daemon.sock"));
+if (!socket) {
+	console.error("ROGER_SOCKET is unset and XDG_RUNTIME_DIR is unset: no host daemon socket to use");
 	process.exit(1);
 }
+const installed = join(homedir(), ".local", "bin", "roger");
+const bin = env("ROGER_BIN") ?? (existsSync(installed) ? installed : "roger");
+const state = env("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
+const store = env("ROGER_STORE") ?? join(state, "roger-shims", "claude", `${session}.store`);
+mkdirSync(dirname(store), { recursive: true });
 function windowMs(env) {
 	const n = env === undefined || env.trim() === "" ? NaN : Number(env);
 	return Number.isInteger(n) && n >= 0 ? n : 10 * 60_000;
 }
 const WINDOW_MS = windowMs(process.env.ROGER_PRESENCE_WINDOW_MS);
-const args = ["adapter", "--socket", socket, "--store", store];
-if (process.env.ROGER_SESSION) args.push("--id", process.env.ROGER_SESSION);
-if (process.env.ROGER_DECLARE) args.push("--declare", process.env.ROGER_DECLARE);
-const adapter = spawn(process.env.ROGER_BIN ?? "roger", args, { stdio: ["pipe", "pipe", "inherit"] });
+const args = ["adapter", "--socket", socket, "--store", store, "--id", session];
+if (env("ROGER_DECLARE")) args.push("--declare", env("ROGER_DECLARE"));
+const adapter = spawn(bin, args, { stdio: ["pipe", "pipe", "inherit"] });
 let closing = false; // our own stdin ended: the adapter's exit is expected
 let dead = null; // why the adapter is gone, once it is
 const gone = (e) => {
@@ -55,7 +76,7 @@ const pending = []; // requests awaiting their reply, in order
 // The adapter answers each request line exactly once, in order; `ready` and
 // `mail` are its only unsolicited lines, so every other line is the oldest
 // pending request's answer.
-let me = process.env.ROGER_SESSION ?? ""; // the Address, from the adapter's ready line
+let me = session; // the Address; the adapter's ready line confirms it
 const inbox = []; // delivered Mail not yet shown to the model (in memory: the durable copy is the adapter's Store)
 const seen = new Set(); // a redelivery after a crash shares its record id
 const waiters = new Set(); // inbox calls waiting for Mail

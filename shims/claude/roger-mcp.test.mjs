@@ -3,7 +3,7 @@
 // protocol handling; it is not harness evidence (scripts/acceptance
 // independence runs the real Claude Code). Run: node --test shims/claude
 import { spawn } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -24,7 +24,10 @@ after(() => {
 });
 
 // Start the shim with a stand-in adapter (a shell script, or a missing path).
-function start(script, env = {}) {
+// An env value of undefined removes that variable. With home, the stand-in is
+// installed at $HOME/.local/bin/roger under a temp HOME and ROGER_BIN, ROGER_SOCKET,
+// ROGER_STORE, ROGER_SESSION and XDG_STATE_HOME start unset, so the shim's defaults apply.
+function start(script, env = {}, { home = false } = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "roger-shim-"));
 	dirs.push(dir);
 	let bin = join(dir, "nonexistent");
@@ -33,10 +36,17 @@ function start(script, env = {}) {
 		writeFileSync(bin, `#!/bin/sh\n${script}\n`);
 		chmodSync(bin, 0o755);
 	}
-	const child = spawn("node", [SHIM], {
-		env: { ...process.env, ROGER_BIN: bin, ROGER_SOCKET: "s", ROGER_STORE: "t", ...env },
-		stdio: ["pipe", "pipe", "pipe"],
-	});
+	const base = { ...process.env, ROGER_BIN: bin, ROGER_SOCKET: "s", ROGER_STORE: "t" };
+	delete base.CLAUDE_CODE_SESSION_ID; // the test runner may itself be a Claude Code child
+	if (home) {
+		mkdirSync(join(dir, ".local", "bin"), { recursive: true });
+		copyFileSync(bin, join(dir, ".local", "bin", "roger"));
+		chmodSync(join(dir, ".local", "bin", "roger"), 0o755);
+		Object.assign(base, { HOME: dir, ROGER_BIN: undefined, ROGER_SOCKET: undefined, ROGER_STORE: undefined, ROGER_SESSION: undefined, XDG_STATE_HOME: undefined });
+	}
+	const merged = { ...base, ...env };
+	for (const k of Object.keys(merged)) if (merged[k] === undefined) delete merged[k];
+	const child = spawn("node", [SHIM], { env: merged, stdio: ["pipe", "pipe", "pipe"] });
 	children.push(child);
 	const lines = [];
 	const waiters = [];
@@ -63,7 +73,7 @@ function start(script, env = {}) {
 	};
 	// Request lines the scripted adapter wrote to $dir/requests (see `logged`).
 	const requests = () => (existsSync(join(dir, "requests")) ? readFileSync(join(dir, "requests"), "utf8") : "").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-	return { child, rpc, reply, call, requests, exited, stderr: () => stderr, lines, cleanup: () => (child.kill(), rmSync(dir, { recursive: true, force: true })) };
+	return { dir, child, rpc, reply, call, requests, exited, stderr: () => stderr, lines, cleanup: () => (child.kill(), rmSync(dir, { recursive: true, force: true })) };
 }
 
 // Shell for a scripted adapter: log one request line, then answer it.
@@ -217,4 +227,68 @@ test("stdin EOF ends the shim with status 0", async () => {
 	const s = start("cat >/dev/null");
 	s.child.stdin.end();
 	assert.equal(await within(5000, s.exited), 0);
+});
+
+// The stand-in logs its argv as JSON strings; the logged file sits beside it
+// (the temp dir for ROGER_BIN, or $HOME/.local/bin for the installed default).
+const ARGV = "for a; do printf '\"%s\"\\n' \"$a\"; done >\"$(dirname \"$0\")/argv\"; cat >/dev/null";
+const argvOf = async (s, id) => {
+	s.rpc(id, "ping");
+	await within(3000, s.reply(id));
+	for (const f of [join(s.dir, "argv"), join(s.dir, ".local", "bin", "argv")])
+		if (existsSync(f)) return readFileSync(f, "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+	throw new Error(`no argv logged; stderr: ${s.stderr()}`);
+};
+const opt = (argv, flag) => argv[argv.indexOf(flag) + 1];
+const SID = "bcbf4c5e-c888-4317-8d21-cadd16846dc1";
+
+test("defaults: the harness session id is the Address; socket, installed bin and Store follow it", async () => {
+	const s = start(ARGV, { CLAUDE_CODE_SESSION_ID: SID, XDG_RUNTIME_DIR: "/run/x" }, { home: true });
+	const argv = await argvOf(s, 20);
+	assert.equal(argv[0], "adapter");
+	assert.equal(opt(argv, "--id"), SID);
+	assert.equal(opt(argv, "--socket"), "/run/x/roger/daemon.sock");
+	assert.equal(opt(argv, "--store"), join(s.dir, ".local", "state", "roger-shims", "claude", `${SID}.store`));
+	assert.ok(existsSync(join(s.dir, ".local", "state", "roger-shims", "claude")), "Store directory created");
+	s.cleanup();
+});
+
+test("XDG_STATE_HOME moves the default Store; empty counts as unset", async () => {
+	const state = mkdtempSync(join(tmpdir(), "roger-state-"));
+	dirs.push(state);
+	const s = start(ARGV, { CLAUDE_CODE_SESSION_ID: SID, XDG_RUNTIME_DIR: "/run/x", XDG_STATE_HOME: state }, { home: true });
+	assert.equal(opt(await argvOf(s, 24), "--store"), join(state, "roger-shims", "claude", `${SID}.store`));
+	assert.ok(existsSync(join(state, "roger-shims", "claude")), "Store directory created");
+	s.cleanup();
+	const e = start(ARGV, { CLAUDE_CODE_SESSION_ID: SID, XDG_RUNTIME_DIR: "/run/x", XDG_STATE_HOME: "" }, { home: true });
+	assert.equal(opt(await argvOf(e, 25), "--store"), join(e.dir, ".local", "state", "roger-shims", "claude", `${SID}.store`));
+	e.cleanup();
+});
+
+test("a harness session id that is not a UUID is ignored: each process gets a fresh UUID", async () => {
+	const ids = [];
+	for (const id of [21, 22]) {
+		const s = start(ARGV, { CLAUDE_CODE_SESSION_ID: "not-a-uuid", XDG_RUNTIME_DIR: "/run/x" }, { home: true });
+		const argv = await argvOf(s, id);
+		ids.push(opt(argv, "--id"));
+		assert.equal(opt(argv, "--store"), join(s.dir, ".local", "state", "roger-shims", "claude", `${opt(argv, "--id")}.store`));
+		s.cleanup();
+	}
+	for (const id of ids) assert.match(id, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+	assert.notEqual(ids[0], ids[1]);
+});
+
+test("explicit env wins over every default", async () => {
+	const s = start(ARGV, { CLAUDE_CODE_SESSION_ID: SID, ROGER_SESSION: "explicit-id", ROGER_SOCKET: "/sock", ROGER_STORE: "store-path" });
+	const argv = await argvOf(s, 23);
+	assert.equal(opt(argv, "--id"), "explicit-id");
+	assert.equal(opt(argv, "--socket"), "/sock");
+	assert.equal(opt(argv, "--store"), "store-path");
+	s.cleanup();
+});
+
+test("no ROGER_SOCKET and no XDG_RUNTIME_DIR ends the shim nonzero and says so", async () => {
+	const s = start(ARGV, { XDG_RUNTIME_DIR: undefined }, { home: true });
+	assert.equal(await within(5000, s.exited), 1);
+	assert.match(s.stderr(), /XDG_RUNTIME_DIR/);
 });
