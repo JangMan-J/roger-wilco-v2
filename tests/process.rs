@@ -591,7 +591,7 @@ fn references_keep_both_integers_and_relabel_keeps_the_address() {
     let store = read(&rig.p("recipient.store"));
     assert_eq!(store.lines().count(), 1, "{store}");
     assert_eq!(
-        count_lines_with(&store, &format!("\"body\":\"{body}\"}}")),
+        count_lines_with(&store, &format!("\"body\":\"{body}\",")),
         1,
         "body field verbatim: {store}"
     );
@@ -1673,5 +1673,216 @@ fn a_second_session_on_one_store_is_refused() {
         &rig.p("recipient1.out"),
         "DELIVERED mail=m-lock record=r-1",
         Duration::from_secs(10),
+    );
+}
+
+fn epoch_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// `roger receipt` for one Mail id, read through host-a's daemon.
+fn receipt_line(rig: &Rig, mail: &str) -> String {
+    let output = Command::new(BIN)
+        .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args(["--mail", mail])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
+/// One `key=<integer>` from a `RECEIPT` or `PENDING` line.
+fn stamp_in(line: &str, key: &str) -> i64 {
+    line.split(' ')
+        .find_map(|w| w.strip_prefix(&format!("{key}=")))
+        .unwrap_or_else(|| panic!("no {key} in {line}"))
+        .parse()
+        .unwrap_or_else(|_| panic!("{key} is not an integer in {line}"))
+}
+
+/// The coordinator stamps a Mail when it answers Accepted and when it records
+/// the Receipt, on its own clock, so their difference is end-to-end latency.
+/// Directed mail and Broadcast copies are stamped alike, the stamps survive a
+/// coordinator restart, and the Store entry carries its own host's time.
+#[test]
+fn receipt_carries_accepted_and_receipted_stamps_on_the_coordinator_clock() {
+    let mut rig = Rig::new("ack-time");
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    rig.start_recipient("recipient1.out", false);
+
+    let before = epoch_ms();
+    rig.send("m-time", "stamp me");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "DELIVERED mail=m-time record=r-1",
+        Duration::from_secs(10),
+    );
+    broadcast_from_sender(&rig, "b-time");
+    let copy = format!("b-time/{RECIPIENT}");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        &format!("DELIVERED mail={copy} record=r-2"),
+        Duration::from_secs(10),
+    );
+    let after = epoch_ms();
+
+    let mut lines = Vec::new();
+    for (mail, record) in [("m-time", "r-1"), (copy.as_str(), "r-2")] {
+        let line = receipt_line(&rig, mail);
+        assert!(
+            line.starts_with(&format!(
+                "RECEIPT mail={mail} to={RECIPIENT} record={record} "
+            )),
+            "{line}"
+        );
+        let (a, r) = (
+            stamp_in(&line, "accepted_at_ms"),
+            stamp_in(&line, "receipted_at_ms"),
+        );
+        assert!(
+            before <= a && a <= r && r <= after,
+            "{before} {line} {after}"
+        );
+        assert_eq!(stamp_in(&line, "latency_ms"), r - a, "{line}");
+        lines.push(line);
+    }
+    let store = read(&rig.p("recipient.store"));
+    for entry in store.lines() {
+        let at: i64 = entry
+            .split("\"stored_at_ms\":")
+            .nth(1)
+            .and_then(|r| r.split([',', '}']).next())
+            .and_then(|n| n.parse().ok())
+            .unwrap_or_else(|| panic!("no stored_at_ms in {entry}"));
+        assert!(before <= at && at <= after, "{entry}");
+    }
+    assert_eq!(count_lines_with(&store, "\"clock\":"), 2, "{store}");
+
+    // Replay keeps every stamp as committed.
+    rig.restart_coordinator();
+    let start = Instant::now();
+    for (line, mail) in lines.iter().zip(["m-time", copy.as_str()]) {
+        loop {
+            let output = Command::new(BIN)
+                .args(["receipt", "--socket", rig.p("a.sock").to_str().unwrap()])
+                .args(["--mail", mail])
+                .output()
+                .unwrap();
+            let got = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if output.status.success() {
+                assert_eq!(&got, line, "stamps changed across a coordinator restart");
+                break;
+            }
+            assert!(start.elapsed() < Duration::from_secs(15), "{output:?}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+/// Before its Ack a Mail is pending, with its Accepted stamp only.
+#[test]
+fn a_mail_not_yet_acked_reads_pending_with_its_accepted_stamp() {
+    let mut rig = Rig::new("ack-time-pending");
+    rig.start_stack();
+    rig.start_recipient("recipient1.out", true);
+    let before = epoch_ms();
+    rig.send("m-pend", "held before its ack");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+    let line = receipt_line(&rig, "m-pend");
+    assert!(
+        line.starts_with(&format!(
+            "PENDING mail=m-pend to={RECIPIENT} accepted_at_ms="
+        )),
+        "{line}"
+    );
+    assert!(stamp_in(&line, "accepted_at_ms") >= before, "{line}");
+    assert!(!line.contains("record="), "{line}");
+}
+
+/// A log written before the stamps existed replays as is: its Mail and
+/// Receipts read with every stamp absent, never zero.
+#[test]
+fn unstamped_log_rows_replay_with_their_stamps_absent() {
+    let mut rig = Rig::new("ack-time-old");
+    let to = RECIPIENT;
+    fs::write(
+        rig.p("coord.log"),
+        format!(
+            "{{\"ev\":\"session\",\"session\":\"{to}\",\"host\":\"host-b\"}}\n\
+             {{\"ev\":\"mail\",\"mail\":\"old-1\",\"from\":\"{SENDER}\",\"to\":\"{to}\",\"body\":\"x\"}}\n\
+             {{\"ev\":\"receipt\",\"mail\":\"old-1\",\"session\":\"{to}\",\"record\":\"r-1\"}}\n\
+             {{\"ev\":\"broadcast\",\"mail\":\"old-b\",\"from\":\"{SENDER}\",\"body\":\"y\",\"to\":[\"{to}\"]}}\n"
+        ),
+    )
+    .unwrap();
+    rig.start_stack();
+    assert_eq!(
+        receipt_line(&rig, "old-1"),
+        format!(
+            "RECEIPT mail=old-1 to={to} record=r-1 accepted_at_ms=absent receipted_at_ms=absent latency_ms=absent"
+        )
+    );
+    assert_eq!(
+        receipt_line(&rig, &format!("old-b/{to}")),
+        format!("PENDING mail=old-b/{to} to={to} accepted_at_ms=absent")
+    );
+}
+
+/// The host daemon's wait for the coordinator to answer a forwarded ack runs
+/// out while the link stays up (the coordinator is stopped, not gone). The
+/// forward is already on the link, so the coordinator records the Receipt as
+/// soon as it runs again, with no reconnect and no replay: its
+/// `receipted_at_ms` follows the stall, not the next reconnect.
+#[test]
+fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resumes() {
+    let mut rig = Rig::new("ack-time-stall");
+    rig.start_stack();
+    let recipient = rig.start_recipient("recipient1.out", true);
+    rig.send("m-stall", "acked into a stalled coordinator");
+    wait_for_file(&rig.p("held.marker"), Duration::from_secs(10));
+
+    let coord = rig.children[rig.coord_idx].id().to_string();
+    let signal = |sig: &str| {
+        assert!(Command::new("kill")
+            .args([sig, &coord])
+            .status()
+            .unwrap()
+            .success());
+    };
+    signal("-STOP");
+    rig.kill(recipient);
+    rig.start_recipient("recipient2.out", true);
+    // The daemon's 10 s wait ran out with the link still up.
+    wait_for_text(
+        &rig.p("daemon-b.out.err"),
+        "receipt m-stall committed, upstream forward deferred: upstream did not answer",
+        Duration::from_secs(15),
+    );
+    assert_eq!(
+        count_lines_with(&read(&rig.p("coord.log")), "\"ev\":\"receipt\""),
+        0
+    );
+    let resumed = epoch_ms();
+    signal("-CONT");
+    wait_for_text(
+        &rig.p("coord.log"),
+        "\"ev\":\"receipt\",\"mail\":\"m-stall\"",
+        Duration::from_secs(2),
+    );
+    let line = receipt_line(&rig, "m-stall");
+    let r = stamp_in(&line, "receipted_at_ms");
+    assert!(
+        resumed <= r && r <= resumed + 2000,
+        "receipt recorded {}ms after the coordinator resumed: {line}",
+        r - resumed
+    );
+    let daemon = read(&rig.p("daemon-b.out.err"));
+    assert!(
+        !daemon.contains("upstream connection closed") && !daemon.contains("replaying"),
+        "the receipt needed a reconnect: {daemon}"
     );
 }

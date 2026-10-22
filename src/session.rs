@@ -164,6 +164,10 @@ fn serve(
         }
     }
     let mut next_record = records.len() as u64 + 1;
+    // Names whose clock `stored_at_ms` was read on.
+    let clock = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|h| h.trim().to_string())
+        .unwrap_or_default();
 
     let conn = UnixStream::connect(&socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
@@ -203,6 +207,10 @@ fn serve(
                             ("mail", s(&mail)),
                             ("from", s(net::field(&v, "from")?)),
                             ("body", s(net::field(&v, "body")?)),
+                            // This host's clock, not the coordinator's: compare
+                            // it only with other stamps from this host.
+                            ("stored_at_ms", Value::Int(local_now_ms())),
+                            ("clock", s(&clock)),
                         ]);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
@@ -356,6 +364,49 @@ fn holder_text(v: &Value) -> String {
         (Ok(h), Some(r)) => format!("holder={h} remaining_ms={r} "),
         _ => String::new(),
     }
+}
+
+/// This host's wall clock in milliseconds since the Unix epoch.
+fn local_now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0)
+}
+
+/// The client: one Mail's lifecycle at the coordinator. Prints `RECEIPT` once
+/// the recipient has acked, else `PENDING`. Both stamps are on the
+/// coordinator's clock, so `latency_ms` is their difference; a stamp the
+/// coordinator's log never held prints `absent`, never zero.
+pub fn receipt(socket: PathBuf, mail: String) -> io::Result<()> {
+    let reply = request(
+        &socket,
+        &obj(vec![
+            ("type", s("receipt")),
+            ("req", Value::Int(1)),
+            ("mail", s(&mail)),
+        ]),
+    )?;
+    let accepted = reply.get("accepted_at_ms").and_then(|x| x.as_i64());
+    let shown = |t: Option<i64>| t.map_or_else(|| "absent".to_string(), |t| t.to_string());
+    let to = net::field(&reply, "to")?;
+    match net::field(&reply, "record") {
+        Ok(record) => {
+            let receipted = reply.get("receipted_at_ms").and_then(|x| x.as_i64());
+            let latency = accepted.zip(receipted).map(|(a, r)| r - a);
+            println!(
+                "RECEIPT mail={mail} to={to} record={record} accepted_at_ms={} receipted_at_ms={} latency_ms={}",
+                shown(accepted),
+                shown(receipted),
+                shown(latency)
+            );
+        }
+        Err(_) => println!(
+            "PENDING mail={mail} to={to} accepted_at_ms={}",
+            shown(accepted)
+        ),
+    }
+    Ok(())
 }
 
 /// The client: one claim operation (`acquire`, `renew`, or `release`) for

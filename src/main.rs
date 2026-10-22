@@ -115,13 +115,17 @@ fn main() -> io::Result<()> {
             PathBuf::from(need(&args, "--socket")?),
             arg(&args, "--from"),
         ),
+        "receipt" => session::receipt(
+            PathBuf::from(need(&args, "--socket")?),
+            need(&args, "--mail")?,
+        ),
         "label" => session::relabel(
             PathBuf::from(need(&args, "--socket")?),
             need(&args, "--from")?,
             need(&args, "--label")?,
         ),
         _ => {
-            eprintln!("usage: roger <coordinator|daemon|session|adapter|send|claim|renew|release|board|label> [flags]");
+            eprintln!("usage: roger <coordinator|daemon|session|adapter|send|claim|renew|release|board|label|receipt> [flags]");
             std::process::exit(2);
         }
     }

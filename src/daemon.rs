@@ -505,7 +505,10 @@ fn local_loop(
                 // Forwarding is retryable, not part of the ack: the Receipt is
                 // already durable in this host daemon, which is core, so the
                 // session is answered now and the receipt is replayed after
-                // the next hello_ok if this forward fails.
+                // the next hello_ok if this forward fails. A forward whose
+                // answer outlasts UPSTREAM_WAIT is still on the link: the
+                // coordinator commits it when it reads it, and its late
+                // `acked` trims the replay list in `upstream_once`.
                 match upstream_request(state, net::ack_msg(&mail, &session, &record)) {
                     Err(e) => {
                         eprintln!("receipt {mail} committed, upstream forward deferred: {e}")
@@ -529,9 +532,9 @@ fn local_loop(
                     ]),
                 )?;
             }
-            // Claims and the Board live only at the coordinator, so the host
-            // daemon relays them and answers under the session's own req.
-            "claim" | "board" => {
+            // Claims, the Board and Receipts live only at the coordinator, so
+            // the host daemon relays them and answers under the session's own req.
+            "claim" | "board" | "receipt" => {
                 let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
                 let mut upstream = v.clone();
                 if let Value::Obj(pairs) = &mut upstream {

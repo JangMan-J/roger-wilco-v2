@@ -1,7 +1,7 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-22T22:15:47Z
+updated: 2026-10-22T22:39:09Z
 agent: claude-opus-5-5
 session: 01a165ae-cb97-75ae-af83-749678e1ae5e
 ---
@@ -193,3 +193,23 @@ _Example_: a session whose adapter's stdin closes leaves the Board at once; Mail
 _Not_: a disconnect (a disconnected session stays registered until its timeout), a Claim release, removal of the session's Store or its pending Mail.
 _Avoid_: deregister, logout
 _Confirmed_: 2026-10-22, Jang ("Unregister is a very reasonable function to add").
+
+**Accepted at**:
+The coordinator's wall-clock time, in milliseconds since the Unix epoch, at which it committed a Mail and answered Accepted (`accepted_at_ms`). It belongs to the coordinator's record of the Mail, never to the Mail; every Broadcast copy carries its broadcast's.
+_Example_: `accepted_at_ms=1792708885590` on the `RECEIPT` line `roger receipt` prints.
+_Not_: a field of a Mail, a time the sender chose, a host daemon's or session's clock.
+_Avoid_: sent at, timestamp
+_Confirmed_: 2026-10-22, Jang (stamp design approved for the ack-time thread).
+
+**Receipted at**:
+The coordinator's wall-clock time, in milliseconds since the Unix epoch, at which it recorded a Receipt (`receipted_at_ms`). Read on the same clock as Accepted at, so `receipted_at_ms - accepted_at_ms` is a Mail's end-to-end latency with no skew between hosts; the core reports that difference and draws nothing from it. A Mail or Receipt committed before either stamp existed reads it as absent, never zero.
+_Example_: `accepted_at_ms=1792708885590 receipted_at_ms=1792708888287 latency_ms=2697` for a Mail whose recipient was killed and restarted before its Ack.
+_Not_: the time the recipient stored the body, an Ack, a delivery time.
+_Avoid_: acked at, delivered at
+_Confirmed_: 2026-10-22, Jang (stamp design approved for the ack-time thread).
+
+**Stored at**:
+The recipient host's wall-clock time, in milliseconds since the Unix epoch, written into its Store entry with the Mail body (`stored_at_ms`), beside `clock` naming that host. It is compared only with other times from that host.
+_Example_: a Store entry `{"record":"r-1",…,"stored_at_ms":1792708694740,"clock":"agent-jail"}`.
+_Not_: a coordinator stamp, a Receipt, an input to latency.
+_Confirmed_: 2026-10-22, Jang (stamp design approved for the ack-time thread).

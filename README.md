@@ -19,7 +19,7 @@ never from argv, which `ps` shows to every user.
 
 One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
-line stream for a shim), `send`, `label`, and the claim and Board client: `claim`, `renew`,
+line stream for a shim), `send`, `label`, `receipt` (see Receipts and latency), and the claim and Board client: `claim`, `renew`,
 `release` (`--socket --owner --key [--ttl-ms]`; exit 3 when refused; `--owner` must be a
 registered session Address, anything else is refused with a reason) and `board`
 (`--socket`; prints `SESSION address= host= label=`, `CLAIM holder= remaining_ms= key=`,
@@ -34,6 +34,21 @@ broadcast copy; the Tracer prints it on its `STORED` line and the adapter passes
 shim. `session` and `adapter` take `--declare <text>`: opaque text the session states about
 itself at Register, stored by the core and returned verbatim; `board` prints it as a
 `DECLARED address= declared=` line after that session's `SESSION` line.
+
+## Receipts and latency
+
+The coordinator stamps each Mail twice on its own clock (milliseconds since the Unix epoch):
+`accepted_at_ms` when it commits the send and answers Accepted, and `receipted_at_ms` when it
+records the Receipt. Both stamps come from one clock, so their difference is end-to-end
+latency with no skew between hosts. Broadcast copies carry the broadcast's `accepted_at_ms`
+and their own `receipted_at_ms`. `receipt --socket <sock> --mail <id>` reads one Mail (a copy
+by its `<mail>/<address>` id) and prints
+`RECEIPT mail= to= record= accepted_at_ms= receipted_at_ms= latency_ms=` once the recipient
+has acked, else `PENDING mail= to= accepted_at_ms=`; an unknown id exits nonzero. A Mail or
+Receipt committed before the stamps existed replays unchanged and prints `absent`, never 0.
+The recipient's Store entry also records `stored_at_ms` on its own host's clock, with
+`clock` naming that host; compare it only with times from that host. The core reports these
+numbers and does nothing else with them.
 
 ## Registration
 

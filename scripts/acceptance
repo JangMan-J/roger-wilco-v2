@@ -137,7 +137,13 @@ cross_host() {
     || fail "coordinator receipt missing or duplicated"
   grep -q '"record":"r-1"' "$work/coord.log" || fail "receipt does not name Store record r-1"
 
-  echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1"
+  # Both stamps are on the coordinator's clock; the latency spans the kill.
+  local rcpt re
+  rcpt="$("$bin" receipt --socket "$work/a.sock" --mail accept-1)" || fail "roger receipt accept-1"
+  re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+\$"
+  [[ "$rcpt" =~ $re ]] || fail "receipt lacks a stamp: $rcpt"
+
+  echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1 ($rcpt)"
 }
 
 # Proof 2. One coordinator, two host daemons, one client binary, one adapter

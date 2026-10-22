@@ -22,9 +22,29 @@ struct Mail {
     from: String,
     to: String,
     body: String,
-    acked: bool,
     /// False only for a Broadcast copy: a broadcast makes no wake request.
     wake: bool,
+    /// When this coordinator committed the send and answered Accepted
+    /// (`accepted_at_ms`, coordinator epoch ms). None for a Mail replayed from
+    /// a log written before the stamp existed: absent, never zero.
+    accepted_at: Option<i64>,
+    /// The Receipt, once the recipient has acked.
+    receipt: Option<Receipt>,
+}
+
+/// The Receipt: the recipient's Record id, and when this coordinator recorded
+/// it (`receipted_at_ms`, the same clock as `accepted_at`, so the difference is
+/// end-to-end latency with no skew between hosts). None when replayed from a
+/// log written before the stamp existed.
+#[derive(Clone)]
+struct Receipt {
+    record: String,
+    at: Option<i64>,
+}
+
+/// An optional stamp from a committed event: absent stays absent.
+fn stamp_of(v: &Value, key: &str) -> Option<i64> {
+    v.get(key).and_then(|x| x.as_i64())
 }
 
 /// The Address a send names to reach every registered session at once.
@@ -203,8 +223,9 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                         from: from.into(),
                         to: to.into(),
                         body: body.into(),
-                        acked: false,
                         wake: true,
+                        accepted_at: stamp_of(v, "accepted_at_ms"),
+                        receipt: None,
                     },
                 );
             }
@@ -220,13 +241,16 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
                     .iter()
                     .filter_map(|x| x.as_str().map(str::to_string))
                     .collect();
-                fan_out(state, mail, from, body, &to);
+                fan_out(state, mail, from, body, &to, stamp_of(v, "accepted_at_ms"));
             }
         }
         Some("receipt") => {
-            if let Ok(mail) = net::field(v, "mail") {
+            if let (Ok(mail), Ok(record)) = (net::field(v, "mail"), net::field(v, "record")) {
                 if let Some(m) = state.mails.get_mut(mail) {
-                    m.acked = true;
+                    m.receipt.get_or_insert(Receipt {
+                        record: record.to_string(),
+                        at: stamp_of(v, "receipted_at_ms"),
+                    });
                 }
             }
         }
@@ -310,7 +334,7 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
     let mut out = Vec::new();
     for id in &state.order {
         let m = &state.mails[id];
-        if m.acked {
+        if m.receipt.is_some() {
             continue;
         }
         if let Some(want) = only_session {
@@ -423,31 +447,22 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                             net::field(&v, "body")?,
                         )?;
                     } else if !st.mails.contains_key(&mail) {
-                        let m = Mail {
-                            from: net::field(&v, "from")?.into(),
-                            to: net::field(&v, "to")?.into(),
-                            body: net::field(&v, "body")?.into(),
-                            acked: false,
-                            wake: true,
-                        };
                         let ev = obj(vec![
                             ("ev", s("mail")),
                             ("mail", s(&mail)),
-                            ("from", s(&m.from)),
-                            ("to", s(&m.to)),
-                            ("body", s(&m.body)),
+                            ("from", s(net::field(&v, "from")?)),
+                            ("to", s(net::field(&v, "to")?)),
+                            ("body", s(net::field(&v, "body")?)),
+                            ("accepted_at_ms", Value::Int(now_ms())),
                         ]);
-                        st.log.append(&json::stringify(&ev))?;
-                        if let Some(h) = host_of(&st, &m.to) {
-                            if let Some((_, w)) = st.hosts.get(h) {
-                                push.push((
-                                    Arc::clone(w),
-                                    net::deliver_msg(&mail, &m.from, &m.to, &m.body, true),
-                                ));
-                            }
+                        commit(&mut st, ev)?;
+                        let m = &st.mails[&mail];
+                        if let Some((_, w)) = host_of(&st, &m.to).and_then(|h| st.hosts.get(h)) {
+                            push.push((
+                                Arc::clone(w),
+                                net::deliver_msg(&mail, &m.from, &m.to, &m.body, true),
+                            ));
                         }
-                        st.order.push(mail.clone());
-                        st.mails.insert(mail.clone(), m);
                     }
                 }
                 net::send(
@@ -528,18 +543,16 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     match st.mails.get(&mail) {
                         None => None,
                         Some(m) => {
-                            let already = m.acked;
+                            let already = m.receipt.is_some();
                             if !already {
                                 let ev = obj(vec![
                                     ("ev", s("receipt")),
                                     ("mail", s(&mail)),
                                     ("session", s(&session)),
                                     ("record", s(&record)),
+                                    ("receipted_at_ms", Value::Int(now_ms())),
                                 ]);
-                                st.log.append(&json::stringify(&ev))?;
-                                if let Some(m) = st.mails.get_mut(&mail) {
-                                    m.acked = true;
-                                }
+                                commit(&mut st, ev)?;
                             }
                             Some(already)
                         }
@@ -563,6 +576,10 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                         ("reason", s("unknown mail")),
                     ]),
                 };
+                net::send(&writer, &reply)?;
+            }
+            "receipt" => {
+                let reply = receipt(&state.lock().unwrap(), &v)?;
                 net::send(&writer, &reply)?;
             }
             "claim" => {
@@ -758,6 +775,39 @@ fn board(st: &State, v: &Value) -> Value {
     ])
 }
 
+/// One Mail's lifecycle as this coordinator recorded it: its recipient, when
+/// it was Accepted, and, once acked, the Receipt's Record id and when it was
+/// recorded. A stamp the log never held is left out, never sent as zero. A
+/// Broadcast copy is read by its copy id.
+fn receipt(st: &State, v: &Value) -> io::Result<Value> {
+    let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
+    let mail = net::field(v, "mail")?;
+    let Some(m) = st.mails.get(mail) else {
+        return Ok(obj(vec![
+            ("type", s("error")),
+            ("req", Value::Int(req)),
+            ("mail", s(mail)),
+            ("reason", s(&format!("unknown mail {mail}"))),
+        ]));
+    };
+    let mut pairs = vec![
+        ("type", s("receipt")),
+        ("req", Value::Int(req)),
+        ("mail", s(mail)),
+        ("to", s(&m.to)),
+    ];
+    if let Some(t) = m.accepted_at {
+        pairs.push(("accepted_at_ms", Value::Int(t)));
+    }
+    if let Some(r) = &m.receipt {
+        pairs.push(("record", s(&r.record)));
+        if let Some(t) = r.at {
+            pairs.push(("receipted_at_ms", Value::Int(t)));
+        }
+    }
+    Ok(obj(pairs))
+}
+
 /// The Mail id of one Broadcast copy: the broadcast's id and the recipient's
 /// Address, so each recipient's copy is delivered, stored, and acked once.
 fn copy_id(mail: &str, to: &str) -> String {
@@ -766,7 +816,14 @@ fn copy_id(mail: &str, to: &str) -> String {
 
 /// Expand a committed Broadcast into one Mail per recipient, carrying no wake
 /// request. Used on commit and on replay, so both see the same copies.
-fn fan_out(st: &mut State, mail: &str, from: &str, body: &str, to: &[String]) {
+fn fan_out(
+    st: &mut State,
+    mail: &str,
+    from: &str,
+    body: &str,
+    to: &[String],
+    accepted_at: Option<i64>,
+) {
     if !st.broadcasts.insert(mail.to_string()) {
         return;
     }
@@ -782,8 +839,9 @@ fn fan_out(st: &mut State, mail: &str, from: &str, body: &str, to: &[String]) {
                 from: from.to_string(),
                 to: addr.clone(),
                 body: body.to_string(),
-                acked: false,
                 wake: false,
+                accepted_at,
+                receipt: None,
             },
         );
     }
@@ -810,9 +868,9 @@ fn broadcast(
         ("from", s(from)),
         ("body", s(body)),
         ("to", Value::Arr(to.iter().map(|a| s(a)).collect())),
+        ("accepted_at_ms", Value::Int(now_ms())),
     ]);
-    st.log.append(&json::stringify(&ev))?;
-    fan_out(st, mail, from, body, &to);
+    commit(st, ev)?;
     let mut push = Vec::new();
     for addr in &to {
         if let Some((_, w)) = host_of(st, addr).and_then(|h| st.hosts.get(h)) {
