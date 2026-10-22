@@ -2,8 +2,8 @@
 type: glossary
 created: 2026-10-21T00:15:26Z
 updated: 2026-10-22T22:15:47Z
-agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
-session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
+agent: claude-opus-5-5
+session: 01a165ae-cb97-75ae-af83-749678e1ae5e
 ---
 
 # Roger-Wilco
