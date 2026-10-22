@@ -44,4 +44,5 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
   clock step frees keys early and a backward one extends them. Nothing in `src/` reads
   another clock for a claim.
 - Keep `src/main.rs` dispatch flat: add an arm, do not restructure.
+- Test-only hooks live behind the `test-hooks` feature and never reach a deploy build.
 - Vectors, not comments, record what was tried; GLOSSARY.md, not comments, defines terms.

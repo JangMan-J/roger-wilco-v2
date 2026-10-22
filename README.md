@@ -7,9 +7,15 @@ before changing anything.
 ## Build and test
 
 ```sh
-cargo test --offline          # unit seams + process seam (real coordinator, daemon, session)
-cargo build --release --offline
+cargo test --offline --features test-hooks   # unit seams + process seam (real coordinator, daemon, session)
+cargo build --release --offline              # what deploy ships: no test hooks
 ```
+
+The `test-hooks` feature adds `--hold-before-ack <marker>` to `session` and `adapter` (park
+between the Store write and the Ack, for the SIGKILL window). Only tests and
+`scripts/acceptance` build with it; `scripts/deploy` refuses a binary that carries it.
+`coordinator` and `daemon` read the fleet token from `ROGER_TOKEN` in their environment,
+never from argv, which `ps` shows to every user.
 
 One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
@@ -28,6 +34,21 @@ broadcast copy; the Tracer prints it on its `STORED` line and the adapter passes
 shim. `session` and `adapter` take `--declare <text>`: opaque text the session states about
 itself at Register, stored by the core and returned verbatim; `board` prints it as a
 `DECLARED address= declared=` line after that session's `SESSION` line.
+
+## Registration
+
+A Register adds an Address to the Board and to every later Broadcast. The registration ends
+in one of two ways, both committed to the coordinator log as an `unregister` event:
+
+- the session says so: `{"type":"unregister"}` on its daemon connection (the adapter sends
+  it when its stdin closes), at once;
+- the session stays disconnected (its connection or its host daemon's link closed, or it
+  never re-registered after a coordinator restart) for `--unregister-after-ms` (default
+  300000), read like a claim deadline at the next request that reads the registered set
+  (Broadcast, Board, claim, relabel). No timer scans for it.
+
+Mail already accepted for an unregistered Address stays pending and is delivered if that
+Address registers again; a connected session never expires.
 
 ## Deploy
 
@@ -90,9 +111,8 @@ Anything that fronts a harness sits on top of the core as an adapter-fronted shi
 `roger adapter` and talks to it in lines; the core never learns which harness is there.
 Every durable log (a Store, the daemon and coordinator logs) is held under an exclusive OS
 lock while open: a second process on the same Store fails at start, naming the file, and
-exits nonzero. When the adapter's stdin reaches EOF it unregisters its Address at the host
-daemon before it exits, so the Board and later broadcasts drop it at once; a shim ends its
-adapter by closing that stdin.
+exits nonzero. When the adapter's stdin reaches EOF it unregisters its Address (see
+Registration) before it exits; a shim ends its adapter by closing that stdin.
 
 Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
 the Mail to its Store (durable), then tells the shim, then sends the Ack; the Ack stays the
