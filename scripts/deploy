@@ -11,7 +11,9 @@
 # installs separately and uses only the binary and the socket.
 #
 # Usage: scripts/deploy <host> [commit]     commit defaults to HEAD
-#   <host> is an ssh destination, or this host's name; it becomes the host id.
+#   <host> is an ssh destination, or this host's name. The host id written to
+#   the target's env is that machine's own `hostname`, never <host>: an ssh
+#   alias names the route, the hostname names the machine (and its clock).
 #   ROGER_BIND (first run only) is the address the coordinator listens on and
 #   every host daemon dials; the default is this host's tailnet IPv4, port 7477. Hosts need lingering
 #   enabled (loginctl enable-linger) for the units to start at boot.
@@ -45,6 +47,9 @@ val() { sed -n "s/^$1=//p" "$ENV_FILE"; }
 token="$(val ROGER_TOKEN)"; coord="$(val ROGER_COORDINATOR)"
 [[ -n "$token" && -n "$coord" ]] || die "$ENV_FILE lacks ROGER_TOKEN or ROGER_COORDINATOR"
 
+host_id="$(echo hostname | on)" || die "read hostname on $host"
+[[ "$host_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "hostname on $host is not a host id: '$host_id'"
+
 work="$(mktemp -d "${TMPDIR:-/tmp}/roger-deploy.XXXXXX")"
 trap 'rm -rf "$work"' EXIT
 mkdir "$work/src"
@@ -55,14 +60,14 @@ bin="$work/target/release/roger"
 ! grep -q -- --hold-before-ack "$bin" || die "the build carries the test hooks; deploy builds without features"
 sum="$(sha256sum "$bin" | cut -d' ' -f1)"
 printf 'commit=%s\nsha256=%s\n' "$commit" "$sum" >"$work/deployed"
-echo "deploy $host: commit $commit sha256 $sum"
+echo "deploy $host: host id $host_id commit $commit sha256 $sum"
 
 units=(roger-daemon.service)
 if ((local_run)); then units=(roger-coordinator.service roger-daemon.service); fi
 {
   echo 'set -e; umask 077; mkdir -p ~/.config/roger ~/.local/bin ~/.local/share/roger ~/.config/systemd/user'
   echo 'cat > ~/.config/roger/env.new <<"ENV"'
-  printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' "$token" "$coord" "$host"
+  printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' "$token" "$coord" "$host_id"
   echo 'ENV'
   echo 'mv -f ~/.config/roger/env.new ~/.config/roger/env'
 } | on || die "write env on $host"

@@ -1,7 +1,7 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-22T22:39:09Z
+updated: 2026-10-22T22:50:59Z
 agent: claude-opus-5-5
 session: 01a165ae-cb97-75ae-af83-749678e1ae5e
 ---
@@ -210,6 +210,6 @@ _Confirmed_: 2026-10-22, Jang (stamp design approved for the ack-time thread).
 
 **Stored at**:
 The recipient host's wall-clock time, in milliseconds since the Unix epoch, written into its Store entry with the Mail body (`stored_at_ms`), beside `clock` naming that host. It is compared only with other times from that host.
-_Example_: a Store entry `{"record":"r-1",…,"stored_at_ms":1792708694740,"clock":"agent-jail"}`.
+_Example_: a Store entry `{"record":"r-1",…,"stored_at_ms":1792708694740,"clock":"JangsJail"}` on the machine reached as `agent-jail`, whose hostname, and so its Host id, is `JangsJail`.
 _Not_: a coordinator stamp, a Receipt, an input to latency.
 _Confirmed_: 2026-10-22, Jang (stamp design approved for the ack-time thread).

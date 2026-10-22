@@ -69,7 +69,8 @@ Address registers again; a connected session never expires.
 
 `scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on
 `<host>`: the release binary at `~/.local/bin/roger` (the replaced one kept as
-`roger.prev`), `~/.config/roger/env`, and the systemd user units in `deploy/`
+`roger.prev`), `~/.config/roger/env` (its `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the ssh name
+used to reach it, so a Host id matches the `clock` its Stores record), and the systemd user units in `deploy/`
 (`roger-daemon.service` on every host, `roger-coordinator.service` on the coordinator host).
 The host daemon serves `$XDG_RUNTIME_DIR/roger/daemon.sock`. That socket and the binary are
 the whole surface for anything on top: a plain client (`roger send`, `roger board`), the

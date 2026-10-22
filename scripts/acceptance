@@ -51,8 +51,10 @@ remote_spawn() { # remote_spawn <pid-file-name> <stdout-file> <args...>
 
 # Two-host core shared by the cross-host checks: build, then a coordinator on
 # this host's tailnet address, a host daemon here (decent-spider, $work/a.sock)
-# and one on $REMOTE_HOST (agent-jail, $remote_work/b.sock). Sets globals
-# bin, work, remote_work, coord.
+# and one on $REMOTE_HOST (agent-jail, $remote_work/b.sock). Each daemon's
+# Host id is its machine's own `hostname`, as scripts/deploy sets it; the ssh
+# alias in $REMOTE_HOST names the route, not the host. Sets globals bin, work,
+# remote_work, coord, local_host_id, remote_host_id.
 two_host_stack() {
   command -v tailscale >/dev/null || fail "tailscale CLI required"
   local ts_ip
@@ -65,6 +67,9 @@ two_host_stack() {
   local token
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
   remote_work="/tmp/roger-accept.$$"
+  local_host_id="$(hostname)"
+  remote_host_id="$(ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" hostname)" || fail "ssh hostname on $REMOTE_HOST"
+  [[ -n "$local_host_id" && -n "$remote_host_id" ]] || fail "empty hostname"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
   export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
 
@@ -77,7 +82,7 @@ two_host_stack() {
   coord="$ts_ip:$(cat "$work/port")"
 
   "$bin" daemon --coordinator "$coord" \
-    --host-id decent-spider --socket "$work/a.sock" --data "$work/a.log" \
+    --host-id "$local_host_id" --socket "$work/a.sock" --data "$work/a.log" \
     >"$work/daemon-a.out" 2>&1 &
   daemon_pid=$!
   wait_for 10 "local daemon socket" test -S "$work/a.sock"
@@ -89,7 +94,7 @@ two_host_stack() {
   scp -q "$bin" "$REMOTE_HOST:$remote_work/roger" || fail "scp binary"
 
   remote_spawn daemon.pid daemon.out \
-    "ROGER_TOKEN=$token ./roger daemon --coordinator $coord --host-id agent-jail --socket $remote_work/b.sock --data $remote_work/b.log" \
+    "ROGER_TOKEN=$token ./roger daemon --coordinator $coord --host-id $remote_host_id --socket $remote_work/b.sock --data $remote_work/b.log" \
     || fail "start remote daemon"
   wait_for 15 "remote daemon socket" ssh -n "$REMOTE_HOST" "test -S $remote_work/b.sock"
 }
@@ -142,6 +147,10 @@ cross_host() {
   rcpt="$("$bin" receipt --socket "$work/a.sock" --mail accept-1)" || fail "roger receipt accept-1"
   re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+\$"
   [[ "$rcpt" =~ $re ]] || fail "receipt lacks a stamp: $rcpt"
+  # The Store names its clock by the machine's hostname, which is the remote
+  # daemon's Host id, whatever ssh alias reached it.
+  ssh -n "$REMOTE_HOST" "grep -qF '\"clock\":\"$remote_host_id\"' $remote_work/recipient.store" \
+    || fail "recipient Store clock is not the remote Host id $remote_host_id"
 
   echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1 ($rcpt)"
 }
@@ -558,6 +567,8 @@ claims() {
   expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
   expect_claim 3 "REFUSED op=renew holder=$a " remote renew --owner "$b" --ttl-ms 60000
   board_one_holder "$a"
+  local_roger board | grep -q "^SESSION address=$b host=$remote_host_id " \
+    || fail "board must place $b on Host id $remote_host_id"
 
   tr="$(now_ms)"
   (( tr < t0 + 4000 )) || fail "too slow: renewal would start after the first deadline"

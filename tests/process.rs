@@ -282,6 +282,11 @@ impl Rig {
     /// Restart the host daemon that serves the recipient, replaying the same
     /// data file, so receipts committed to that log are replayed from disk.
     fn restart_recipient_daemon(&mut self) {
+        self.restart_recipient_daemon_as("host-b");
+    }
+
+    /// Restart that host daemon under Host id `host`, same socket and log.
+    fn restart_recipient_daemon_as(&mut self, host: &str) {
         self.kill(2);
         let coord = format!("127.0.0.1:{}", self.coord_port);
         let args: Vec<String> = vec![
@@ -289,7 +294,7 @@ impl Rig {
             "--coordinator".into(),
             coord,
             "--host-id".into(),
-            "host-b".into(),
+            host.into(),
             "--socket".into(),
             self.p("b.sock").to_str().unwrap().into(),
             "--data".into(),
@@ -1885,4 +1890,67 @@ fn a_receipt_whose_answer_stalled_past_the_wait_lands_when_the_coordinator_resum
         !daemon.contains("upstream connection closed") && !daemon.contains("replaying"),
         "the receipt needed a reconnect: {daemon}"
     );
+}
+
+/// A host daemon restarted under a new Host id keeps everything: its
+/// session re-registers there, Mail accepted while it was down and Mail held
+/// in its local inbox are each delivered once, and the session's claim stays
+/// held, because Mail and claims are keyed by Address and the Host id only
+/// routes.
+#[test]
+fn a_host_id_change_keeps_sessions_pending_mail_and_claims() {
+    let mut rig = Rig::new("host-id-change");
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    let recipient = rig.start_recipient("recipient1.out", false);
+    assert_eq!(claim_cmd(&rig, "b.sock", "claim", RECIPIENT, 60_000).0, 0);
+    rig.send("m-before", "before the rename");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "DELIVERED mail=m-before record=r-1",
+        Duration::from_secs(10),
+    );
+
+    // Session gone, daemon up: this Mail waits in host-b's local inbox.
+    rig.kill(recipient);
+    wait_connected(&rig, "a.sock", false);
+    rig.send("m-inbox", "held by the daemon");
+    wait_for_text(&rig.p("b.log"), "m-inbox", Duration::from_secs(10));
+    // Daemon gone too: this Mail waits only at the coordinator.
+    rig.kill(2);
+    rig.send("m-coord", "held by the coordinator");
+
+    rig.restart_recipient_daemon_as("host-b-renamed");
+    rig.start_recipient("recipient2.out", false);
+    for mail in ["m-inbox", "m-coord"] {
+        wait_for_text(
+            &rig.p("recipient2.out"),
+            &format!("DELIVERED mail={mail} record="),
+            Duration::from_secs(10),
+        );
+    }
+
+    let b = board(&rig, "a.sock");
+    assert!(
+        b.contains(&format!(
+            "SESSION address={RECIPIENT} host=host-b-renamed connected=true "
+        )),
+        "{b}"
+    );
+    assert_eq!(count_lines_with(&b, "SESSION "), 2, "{b}");
+    assert_one_holder(&rig, RECIPIENT);
+    assert_eq!(claim_cmd(&rig, "b.sock", "renew", RECIPIENT, 60_000).0, 0);
+
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(store.lines().count(), 3, "{store}");
+    let coord = read(&rig.p("coord.log"));
+    for mail in ["m-before", "m-inbox", "m-coord"] {
+        assert_eq!(
+            count_lines_with(&store, &format!("\"{mail}\"")),
+            1,
+            "{store}"
+        );
+        let row = format!("\"ev\":\"receipt\",\"mail\":\"{mail}\"");
+        assert_eq!(count_lines_with(&coord, &row), 1, "{coord}");
+    }
 }
