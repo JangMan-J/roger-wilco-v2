@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Acceptance checks named by KERNEL.md proofs.
-# Usage: scripts/acceptance <cross-host|independence|pi-shim|claims|references|broadcast|wake>
+# Usage: scripts/acceptance <cross-host|no-poll|independence|pi-shim|claims|references|broadcast|wake>
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -836,13 +836,231 @@ wake() {
   echo "PASS wake: idle Pi session started a turn $(( t1 - t0 )) ms after directed Mail (declared ${declared} ms on the Board); busy session stored and acked the same Mail at once and handed it to the model at the turn boundary; a broadcast to the idle session started no turn; each Mail stored, acked, and shown once"
 }
 
+# Invariant 2: no fixed-interval scan on the correctness path. Mail, receipts,
+# claim expiry and unregister follow committed events, with every sweep
+# disabled. The core has no sweep to disable: nothing in src runs on a timer
+# (scripts/check-no-poll finds only the daemon's reconnect backoff, the
+# daemon's bounded wait for one upstream reply, and the Store lock's single
+# try). A sweep added later must take a switch that this check turns off; the
+# idle windows below fail while one runs, since they require that nothing is
+# committed while nobody asks.
+#
+# Each phase isolates event triggers, so removing any one of them fails it:
+#   directed  coordinator push on a committed send; host daemon push on a
+#             committed deliver; host daemon forwarding an ack upstream
+#   broadcast coordinator push of each committed copy
+#   register  coordinator push of pending mail on a session's Register
+#   hello     coordinator push of a host's pending mail on its daemon's hello
+#   claims    expiry read from the committed deadline at the next request
+#   leave     explicit unregister; a session connection closing; a host
+#             daemon link dropping; expiry read at Broadcast, claim, relabel
+#             and Board
+#   offline   host daemon push from its inbox on a Register while the
+#             coordinator is down; receipt replay on the next hello
+# Every host daemon still running when the coordinator comes back is a fresh
+# process, so the reconnect backoff never carries a result. Loopback only.
+NP_GRACE_MS=2000
+NP_LINK_LOST='upstream (error|connection closed)' # what a host daemon prints before it reconnects
+no_poll() {
+  command -v jq >/dev/null || fail "jq required"
+  "$ROOT/scripts/check-no-poll" >/dev/null || fail "scripts/check-no-poll found an unmarked timed wait in src"
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
+  bin="$ROOT/target/release/roger"
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token"
+  trap cleanup EXIT
+
+  local r="$RECIPIENT" l="55555555-5555-4555-8555-555555555555"
+  local x="66666666-6666-4666-8666-666666666666" e="77777777-7777-4777-8777-777777777777"
+  local r_pid l_pid lines i d pid reader
+  declare -A dpid=()
+
+  coordinator_start() { # coordinator_start <bind> <out>
+    "$bin" coordinator --bind "$1" --port-file "$work/port" --data "$work/coord.log" \
+      --unregister-after-ms "$NP_GRACE_MS" >"$work/$2" 2>&1 &
+    coord_pid=$!
+    wait_for 10 "coordinator listening ($2)" grep -q 'coordinator listening' "$work/$2"
+  }
+  daemon_start() { # daemon_start <h> <generation>; sets dpid[<h>]
+    "$bin" daemon --coordinator "$coord" --host-id "host-$1" --socket "$work/$1.sock" \
+      --data "$work/$1.log" >"$work/daemon-$1$2.out" 2>&1 &
+    dpid[$1]=$!
+    pids+=("${dpid[$1]}")
+    wait_for 10 "daemon $1$2 socket" test -S "$work/$1.sock"
+  }
+  daemon_stop() { kill -9 "${dpid[$1]}" 2>/dev/null; wait "${dpid[$1]}" 2>/dev/null || true; }
+  tracer() { # tracer <h> <address> <name>: start a Tracer; sets tracer_pid
+    "$bin" session --socket "$work/$1.sock" --id "$2" --store "$work/$3.store" >>"$work/$3.out" 2>&1 &
+    tracer_pid=$!
+    pids+=("$tracer_pid")
+  }
+  registered() { grep -qF "\"ev\":\"session\",\"session\":\"$1\"" "$work/coord.log"; }
+  unregistered() { grep -qF "\"ev\":\"unregister\",\"session\":\"$1\"" "$work/coord.log"; }
+  receipt() { grep -qF "\"ev\":\"receipt\",\"mail\":\"$1\"" "$work/coord.log"; }
+  send() { # send <h> <to> <mail> <body>
+    "$bin" send --socket "$work/$1.sock" --from "$SENDER" --to "$2" --mail "$3" --body "$4" \
+      | grep -q "ACCEPTED mail=$3" || fail "send $3 not accepted"
+  }
+  # idle <ms> <why>: nobody asks for <ms>; no log in the core may grow.
+  idle() {
+    local before after
+    before="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
+    sleep "$(awk -v ms="$1" 'BEGIN { print ms / 1000 }')"
+    after="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
+    [[ "$before" == "$after" ]] || fail "$2: a log grew from $before to $after lines while nobody asked"
+  }
+
+  coordinator_start 127.0.0.1:0 coord1.out
+  coord="127.0.0.1:$(cat "$work/port")"
+  daemon_start a 1
+  daemon_start b 1
+
+  # directed: R is connected on host-b; a send from host-a reaches its Store,
+  # and its ack becomes a receipt at the coordinator.
+  tracer b "$r" r; r_pid=$tracer_pid
+  wait_for 10 "R registered" registered "$r"
+  send a "$r" np-1 "directed [[0:FLEET:0]]"
+  wait_for 10 "directed: np-1 delivered to a connected session" grep -q 'DELIVERED mail=np-1 record=r-1' "$work/r.out"
+  wait_for 10 "directed: receipt for np-1 at the coordinator" receipt np-1
+
+  # broadcast: the committed copy is pushed to the connected session.
+  send a '*' np-b1 "broadcast [[0:FLEET:0]]"
+  wait_for 10 "broadcast: copy stored without wake" grep -q "STORED mail=np-b1/$r record=r-2 wake=false" "$work/r.out"
+  wait_for 10 "broadcast: receipt for the copy" receipt "np-b1/$r"
+
+  # register: mail for an Address no host daemon has seen waits at the
+  # coordinator until that Address registers.
+  send a "$l" np-2 "before register [[153:Meteor Shower:7]]"
+  grep -qF '"mail":"np-2"' "$work/a.log" && fail "register: np-2 reached a host daemon before its recipient registered"
+  tracer a "$l" l; l_pid=$tracer_pid
+  wait_for 10 "register: np-2 delivered on Register" grep -q 'DELIVERED mail=np-2 record=r-1' "$work/l.out"
+  wait_for 10 "register: receipt for np-2" receipt np-2
+
+  # hello: mail for a host whose daemon is down reaches that daemon's inbox
+  # on its hello, before any session registers there.
+  daemon_stop a
+  wait "$l_pid" 2>/dev/null || true
+  send b "$l" np-3 "while host-a is down"
+  daemon_start a 2
+  wait_for 10 "hello: np-3 in host-a's inbox with no session registered" grep -qF '"ev":"deliver","mail":"np-3"' "$work/a.log"
+  tracer a "$l" l; l_pid=$tracer_pid
+  wait_for 10 "hello: np-3 delivered" grep -q 'DELIVERED mail=np-3 record=r-2' "$work/l.out"
+  wait_for 10 "hello: receipt for np-3" receipt np-3
+
+  # claims: expiry is read from the committed deadline at the next request.
+  local key="[[0:np:0]]" out
+  out="$("$bin" claim --socket "$work/a.sock" --owner "$l" --key "$key" --ttl-ms 1500)" \
+    || fail "claims: L's acquire refused: $out"
+  out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
+    && fail "claims: a second owner took a held key: $out"
+  idle 2000 "claims: past the deadline"
+  out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
+    || fail "claims: the key was not free at the first request after its deadline: $out"
+  [[ "$out" == "CLAIMED op=acquire holder=$r "* ]] || fail "claims: expected R to hold the key, saw: $out"
+  grep -q '"ev":"release"' "$work/coord.log" && fail "claims: a release freed the key, not expiry"
+
+  # leave, explicit: an adapter whose stdin closes unregisters at once, with
+  # no registered-set read to do it.
+  mkfifo "$work/x.in"
+  "$bin" adapter --socket "$work/b.sock" --id "$x" --store "$work/x.store" <"$work/x.in" >"$work/x.out" 2>&1 &
+  pids+=("$!")
+  exec 4>"$work/x.in"
+  wait_for 10 "leave: X registered" registered "$x"
+  exec 4>&-
+  wait_for 10 "leave: X unregistered on stdin EOF" unregistered "$x"
+
+  # leave, by grace: a session whose connection closed is unregistered by the
+  # first registered-set read after the grace, by each kind of read, and by
+  # nothing before it.
+  i=0
+  for reader in broadcast claim relabel board; do
+    i=$((i + 1))
+    d="8888888${i}-8888-4888-8888-88888888888${i}"
+    tracer b "$d" "d$i"; pid=$tracer_pid
+    wait_for 10 "leave: D$i registered" registered "$d"
+    kill -9 "$pid"; wait "$pid" 2>/dev/null || true
+    idle $((NP_GRACE_MS + 700)) "leave: D$i past its grace"
+    unregistered "$d" && fail "leave: D$i unregistered with no read"
+    case "$reader" in
+      broadcast) send a '*' np-b2 "after a grace"
+        wait_for 10 "leave: np-b2 receipts" receipt "np-b2/$r"
+        wait_for 10 "leave: np-b2 receipts" receipt "np-b2/$l" ;;
+      claim) "$bin" claim --socket "$work/a.sock" --owner "$l" --key "[[1:np:1]]" --ttl-ms 60000 >/dev/null \
+        || fail "leave: L's claim refused" ;;
+      relabel) "$bin" label --socket "$work/a.sock" --from "$l" --label "[[0:FLEET:0]] L" >/dev/null \
+        || fail "leave: relabel refused" ;;
+      board) "$bin" board --socket "$work/a.sock" >"$work/board.out" || fail "leave: board read failed" ;;
+    esac
+    unregistered "$d" || fail "leave: D$i not unregistered by the first $reader after its grace (its connection closed, or that read does not expire)"
+  done
+  jq -e --arg d "88888881-8888-4888-8888-888888888881" --arg r "$r" --arg l "$l" \
+    'select(.ev == "broadcast" and .mail == "np-b2") | .to | (any(. == $d) | not) and any(. == $r) and any(. == $l)' \
+    "$work/coord.log" >/dev/null || fail "leave: np-b2 went to an expired session or missed a live one"
+  grep -q '^SESSION address=8888888' "$work/board.out" && fail "leave: the Board shows an expired session"
+  for d in "$r" "$l"; do
+    grep -q "^SESSION address=$d .*connected=true" "$work/board.out" || fail "leave: connected session $d left the Board"
+  done
+
+  # leave, by a host daemon's link dropping: the daemon dies with its session
+  # and cannot report the disconnect.
+  daemon_start c 1
+  tracer c "$e" e; pid=$tracer_pid
+  wait_for 10 "leave: E registered" registered "$e"
+  daemon_stop c
+  wait "$pid" 2>/dev/null || true
+  idle $((NP_GRACE_MS + 700)) "leave: E past its grace"
+  "$bin" board --socket "$work/a.sock" >"$work/board.out" || fail "leave: board read failed"
+  unregistered "$e" || fail "leave: E not unregistered after its host daemon's link dropped"
+
+  # offline: with the coordinator down, R registers and its host daemon
+  # delivers np-5 from its inbox; the receipt reaches the coordinator on the
+  # next hello.
+  kill -9 "$r_pid"; wait "$r_pid" 2>/dev/null || true
+  send a "$r" np-5 "while R is down"
+  wait_for 10 "offline: np-5 in host-b's inbox" grep -qF '"ev":"deliver","mail":"np-5"' "$work/b.log"
+  # Every host daemon so far kept its first link to the coordinator.
+  grep -qE "$NP_LINK_LOST" "$work"/daemon-*.out && fail "a host daemon lost its link: $(grep -hE "$NP_LINK_LOST" "$work"/daemon-*.out)"
+  kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
+  wait_for 10 "offline: host-b saw the coordinator go" grep -qE "$NP_LINK_LOST" "$work/daemon-b1.out"
+  tracer b "$r" r; r_pid=$tracer_pid
+  wait_for 10 "offline: np-5 delivered from host-b's inbox" grep -q 'DELIVERED mail=np-5' "$work/r.out"
+  receipt np-5 && fail "offline: receipt for np-5 with the coordinator down"
+  daemon_stop a
+  daemon_stop b
+  wait "$r_pid" 2>/dev/null || true
+  coordinator_start "$coord" coord2.out
+  daemon_start b 2
+  wait_for 10 "offline: receipt for np-5 replayed on hello" receipt np-5
+
+  # The host daemon running at the end connected at its first try.
+  grep -qE "$NP_LINK_LOST" "$work/daemon-b2.out" && fail "host-b reconnected: $(grep -hE "$NP_LINK_LOST" "$work/daemon-b2.out")"
+
+  # Nothing lost, nothing twice.
+  for m in np-1 np-2 np-3 np-5 "np-b1/$r" "np-b2/$r" "np-b2/$l"; do
+    log_count "\"ev\":\"receipt\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one receipt"
+  done
+  for m in np-1 np-2 np-3 np-5; do
+    log_count "\"ev\":\"mail\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one mail row"
+  done
+  for m in np-1 np-b1/ np-b2/ np-5; do
+    log_count "\"mail\":\"$m" 1 "$work/r.store" || fail "R's Store must hold $m once"
+  done
+  for m in np-2 np-3 np-b2/; do
+    log_count "\"mail\":\"$m" 1 "$work/l.store" || fail "L's Store must hold $m once"
+  done
+
+  echo "PASS no-poll: with no sweep in the core, directed mail, a broadcast, mail pending at Register and at a host daemon's hello, and mail held in a host daemon's inbox while the coordinator was down were each delivered and acked once; receipts reached the coordinator on the ack and on replay; a claim expired at the first request past its deadline; sessions were unregistered on stdin EOF and, after their grace, by the first Broadcast, claim, relabel and Board read (after a closed connection and a dropped host link); and no log grew while nobody asked"
+}
+
 case "${1:-}" in
   cross-host) cross_host ;;
+  no-poll) no_poll ;;
   independence) independence ;;
   pi-shim) pi_shim ;;
   claims) claims ;;
   references) references ;;
   broadcast) broadcast ;;
   wake) wake ;;
-  *) echo "usage: $0 <cross-host|independence|pi-shim|claims|references|broadcast|wake>" >&2; exit 2 ;;
+  *) echo "usage: $0 <cross-host|no-poll|independence|pi-shim|claims|references|broadcast|wake>" >&2; exit 2 ;;
 esac

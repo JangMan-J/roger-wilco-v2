@@ -84,6 +84,7 @@ scripts/check                     # the core gate
 scripts/check-all                 # the core gate, then each shim's own check
 scripts/check-harness-free        # invariant: no harness identity anywhere in the core
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
+scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
 scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
 scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
 scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
@@ -95,6 +96,11 @@ scripts/acceptance references     # proof 6: references keep both integers verba
 tests, scripts, deploy units, and docs, this README included), except `scripts/acceptance`,
 whose proofs 2 and 5 run real harnesses by definition. What a proof needs from a harness is
 in that shim's README.
+
+`scripts/acceptance no-poll` runs the real binaries with no sweep (the core has none; a sweep
+added later needs a switch that this check turns off). Each phase leaves one event trigger as
+the only path to its result, so removing any trigger fails it, and its idle windows fail if any
+core log grows while nobody asks.
 
 `scripts/acceptance references` reads the Board through `roger board` (proof 4) and also
 searches `src/` for any code that parses a Reference or inspects a label (invariant 3).
