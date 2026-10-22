@@ -23,9 +23,9 @@
 // Address with its own Store: Pi emits session_shutdown first, and this shim
 // waits for the old adapter to exit before the replacement runtime's
 // session_start starts the next one. Within one runtime a recurring
-// session_start reuses the running adapter. Across Pi processes, the
-// `<store>.lock` file (holding the Pi pid) refuses a second adapter on a
-// Store whose holder is alive.
+// session_start reuses the running adapter. Across Pi processes, the core
+// holds each Store under an exclusive lock: a second adapter on the same Store
+// fails at start naming the file, and the shim reports that adapter's exit.
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
@@ -33,7 +33,7 @@ import { createInterface } from "node:readline";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerRogerCommand } from "./roger-command.ts";
-import { lockStore, settings } from "./roger-env.ts";
+import { settings } from "./roger-env.ts";
 
 type Reply = Record<string, unknown>;
 type Pending = { ok: (reply: Reply) => void; fail: (e: Error) => void };
@@ -62,8 +62,6 @@ export default function (pi: ExtensionAPI) {
 		for (const p of pending.splice(0)) p.fail(e);
 	};
 
-	let unlock: (() => void) | undefined; // releases this runtime's Store lock
-
 	const start = (sessionId: string | undefined) => {
 		// session_start may recur while this runtime lives; a second adapter
 		// would be a second writer of the same Store.
@@ -71,7 +69,6 @@ export default function (pi: ExtensionAPI) {
 		let cfg;
 		try {
 			cfg = settings(process.env, sessionId, homedir(), randomUUID);
-			unlock = lockStore(cfg.store);
 		} catch (e) {
 			why = (e as Error).message;
 			process.stderr.write(`roger shim: ${why}\n`);
@@ -88,8 +85,6 @@ export default function (pi: ExtensionAPI) {
 			if (adapter !== child) return;
 			adapter = undefined;
 			why = e.message;
-			unlock?.();
-			unlock = undefined;
 			process.stderr.write(`roger shim: ${e.message}\n`);
 			failAll(e);
 		};
@@ -144,11 +139,7 @@ export default function (pi: ExtensionAPI) {
 		adapter = undefined;
 		why = "roger shim shut down";
 		failAll(new Error(why));
-		const release = () => {
-			unlock?.();
-			unlock = undefined;
-		};
-		if (!child || child.exitCode !== null || child.signalCode !== null) return release();
+		if (!child || child.exitCode !== null || child.signalCode !== null) return;
 		// The adapter exits when its stdin closes. Wait for it, SIGKILL after 3 s
 		// and wait again, so a session started right after never overlaps it on
 		// the same Store.
@@ -157,7 +148,6 @@ export default function (pi: ExtensionAPI) {
 			child.once("exit", () => (clearTimeout(t), done()));
 			child.stdin?.end();
 		});
-		release();
 	});
 
 	registerRogerCommand(pi, { me: () => me, request, send });

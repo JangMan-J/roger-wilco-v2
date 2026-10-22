@@ -3,7 +3,15 @@
 # Coordinator, host daemon, client, and adapter name no harness, read no
 # harness store, and link no harness SDK. Only a shim may know.
 #
-# Usage: scripts/check-harness-free [subdir ...]   (default: src)
+# The core is every file in the checkout (tracked or untracked, minus
+# .gitignore) outside shims/ and VECTORS/: source, tests, scripts, deploy
+# units, and docs, README.md included. Exempt:
+#   shims/              adapters on top of the core; each may know its harness
+#   VECTORS/            the record of what was tried
+#   scripts/acceptance  proofs 2 and 5 run real harnesses by definition
+#   scripts/check-harness-free  this list of names
+#
+# Usage: scripts/check-harness-free [path ...]   (default: the whole core)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,12 +20,15 @@ cd "$ROOT"
 # Whole-word matches only: "pipe" and "copy" must not trip on "pi".
 HARNESSES='pi|claude|claude-code|codex|gemini|cursor|aider|copilot|herdr|zellij|opencode|goose|cline|roo|amp|letta|windsurf'
 
-dirs=("${@:-src}")
-status=0
+mapfile -t files < <(git ls-files --cached --others --exclude-standard -- "${@:-.}" |
+  grep -vE '^(shims|VECTORS)/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+  while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
+((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
-hits="$(grep -rniE "\b($HARNESSES)\b" "${dirs[@]}" --include='*.rs' || true)"
+status=0
+hits="$(grep -HniIE "\b($HARNESSES)\b" -- "${files[@]}" || true)"
 if [[ -n "$hits" ]]; then
-  echo "FAIL: harness named in core source:" >&2
+  echo "FAIL: harness named in the core (only shims/ may name one):" >&2
   echo "$hits" >&2
   status=1
 fi
@@ -30,6 +41,6 @@ if [[ -n "$deps" ]]; then
 fi
 
 if [[ "$status" == 0 ]]; then
-  echo "PASS harness-free: no harness name in ${dirs[*]}, no external crate dependencies"
+  echo "PASS harness-free: no harness name in ${#files[@]} core files under ${*:-.}, no external crate dependencies"
 fi
 exit "$status"

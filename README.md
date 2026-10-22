@@ -27,8 +27,7 @@ copy id. Every delivery carries `wake`: true for directed mail, false for a
 broadcast copy; the Tracer prints it on its `STORED` line and the adapter passes it to the
 shim. `session` and `adapter` take `--declare <text>`: opaque text the session states about
 itself at Register, stored by the core and returned verbatim; `board` prints it as a
-`DECLARED address= declared=` line after that session's `SESSION` line. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
-`shims/claude/roger-mcp.mjs` (Claude Code MCP server).
+`DECLARED address= declared=` line after that session's `SESSION` line.
 
 ## Deploy
 
@@ -54,52 +53,56 @@ the coordinator rather than letting memory and disk diverge; a restart replays t
 
 ## Checks
 
-`scripts/check` is the gate every change passes before it lands on main (fmt, clippy with
-warnings denied, tests, harness-free). Review rules are in `CODING_STANDARDS.md`.
+`scripts/check` is the core gate every change passes before it lands on main (fmt, clippy
+with warnings denied, tests, harness-free, no-poll); it names no harness.
+`scripts/check-all` runs it and then every `shims/<name>/check` it finds. Review rules are
+in `CODING_STANDARDS.md`.
 
 ```sh
-scripts/check                     # the gate
+scripts/check                     # the core gate
+scripts/check-all                 # the core gate, then each shim's own check
+scripts/check-harness-free        # invariant: no harness identity anywhere in the core
 scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
-scripts/acceptance broadcast     # proof 3: one broadcast reaches every registered session once, no wake
-scripts/acceptance claims        # proof 4: claims are exclusive, renew, expire; board on both hosts
-scripts/acceptance wake           # proof 5: directed mail wakes an idle Pi session; busy queues to the turn boundary
-scripts/acceptance pi-shim        # Pi shim lifecycle and roger_send tool callback; no model
-node --test shims/claude          # Claude shim protocol and lifecycle against a scripted adapter
-scripts/acceptance independence   # proof 2: Pi and Claude Code sessions (plus a Tracer) exchange mail; loopback
+scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
+scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
+scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
+scripts/acceptance wake           # proof 5: directed mail wakes an idle session; busy queues to the turn boundary
 scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
-scripts/check-harness-free        # invariant: no harness identity in the core
 ```
+
+`scripts/check-harness-free` covers every file outside `shims/` and `VECTORS/` (source,
+tests, scripts, deploy units, and docs, this README included), except `scripts/acceptance`,
+whose proofs 2 and 5 run real harnesses by definition. What a proof needs from a harness is
+in that shim's README.
 
 `scripts/acceptance references` reads the Board through `roger board` (proof 4) and also
 searches `src/` for any code that parses a Reference or inspects a label (invariant 3).
-
-`scripts/acceptance independence` needs `pi`, `claude` (logged in) and `node`. It makes one
-real Claude Code model call (haiku); Pi needs none. Claude's tool results are read from its
-own stream-json output.
-
-Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
-the Mail to its Store (durable), then tells the shim, then sends the Ack; the Ack stays the
-adapter's responsibility and a shim never sends it. What a shim has shown its harness is not
-durable. The Claude shim keeps unshown Mail in memory for `roger_inbox`. If it dies, the Mail is
-still in the Store. If the adapter died before its Ack, the core redelivers and the Store reuses
-the same record, so a restarted shim is told again; Mail already acked is not replayed to a model.
-The Pi shim writes each delivery into Pi's transcript.
-
-Wake is the shim's job; the core carries no busy or idle state. The Pi shim declares
-`wake-latency-ms=<n>` through `--declare` (`ROGER_WAKE_LATENCY_MS`, default 1000; `off` declares
-nothing and never wakes). A delivery with `wake: true` goes to Pi as
-`sendMessage(..., { triggerTurn: true, deliverAs: "followUp" })`: an idle Pi starts a turn, a
-busy Pi queues it and hands it to the model at the turn boundary. A `wake: false` delivery
-(a broadcast copy) is rendered with `triggerTurn: false`. The Store write and the Ack wait for
-neither. `scripts/acceptance wake` drives this with a scripted faux model
-(`shims/pi/test/faux-model.ts`), so it needs `pi` but makes no model call. The Claude shim
-does not wake and declares no wake latency; `ROGER_DECLARE=<text>` passes opaque text as
-`--declare` (unset declares nothing).
 
 `scripts/acceptance cross-host` runs the coordinator on this host's tailnet
 address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
 `agent-jail`), and requires SSH to that host plus `scp`. It builds release
 binaries, then removes every process and directory it created.
+
+## Adapters
+
+Anything that fronts a harness sits on top of the core as an adapter-fronted shim under
+`shims/<name>/`, each with its own README, install script and `check`. A shim starts
+`roger adapter` and talks to it in lines; the core never learns which harness is there.
+Every durable log (a Store, the daemon and coordinator logs) is held under an exclusive OS
+lock while open: a second process on the same Store fails at start, naming the file, and
+exits nonzero. When the adapter's stdin reaches EOF it unregisters its Address at the host
+daemon before it exits, so the Board and later broadcasts drop it at once; a shim ends its
+adapter by closing that stdin.
+
+Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
+the Mail to its Store (durable), then tells the shim, then sends the Ack; the Ack stays the
+adapter's responsibility and a shim never sends it. What a shim has shown its harness is not
+durable. If the adapter died before its Ack, the core redelivers and the Store reuses the same
+record, so a restarted shim is told again; Mail already acked is not replayed to a model.
+
+Wake is the shim's job; the core carries no busy or idle state. A shim that can start a turn
+declares `wake-latency-ms=<n>` through `--declare` and acts on each delivery's `wake` flag;
+the Store write and the Ack wait for neither.
 
 ## Layout
 
@@ -109,8 +112,7 @@ binaries, then removes every process and directory it created.
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped agent session (Tracer) and adapter; writes its Store, then acks |
-| `shims/claude/roger-mcp.mjs` | Claude Code shim: `roger_send`, `roger_inbox`, `roger_board`, `roger_label`, `roger_claim`, `roger_release` MCP tools over the adapter |
-| `shims/pi/roger.ts` | Pi shim: renders mail into the transcript, forwards `/roger-send` and the `roger_send` tool |
+| `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | one-object-per-line codec |
 | `tests/process.rs` | process seam, including the SIGKILL window |

@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# The core gate, then every shim's own check (shims/*/check), found by listing:
+# adding or removing a shim needs no edit here.
+# Usage: scripts/check-all
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+echo "== scripts/check"
+scripts/check
+n=0
+for c in shims/*/check; do
+  [[ -x "$c" ]] || continue
+  echo "== $c"
+  "$c"
+  n=$((n + 1))
+done
+echo "PASS check-all (core + $n shim checks)"

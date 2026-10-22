@@ -8,7 +8,7 @@
 #   shims/pi/install --uninstall  remove that entry and that directory; Stores stay
 #
 # Idempotent: rerunning replaces the copy and leaves one entry. Touches nothing
-# outside its own directory and its own entry in Pi's settings. See INSTALL.md.
+# outside its own directory and its own entry in Pi's settings. See README.md.
 set -euo pipefail
 
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

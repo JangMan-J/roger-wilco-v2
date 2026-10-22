@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# The Claude Code shim's own check: its protocol and lifecycle tests against a
+# scripted adapter; no `claude` binary needed. scripts/acceptance independence
+# drives the real Claude Code.
+set -euo pipefail
+cd "$(dirname "${BASH_SOURCE[0]}")"
+exec node --test
