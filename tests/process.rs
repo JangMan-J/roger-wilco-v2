@@ -1,5 +1,9 @@
 //! Process-level seam: real coordinator, daemon, and session processes on
 //! loopback. Expected values are the literals chosen here, per proof 1.
+//! The SIGKILL window needs the session's `--hold-before-ack` test hook.
+
+#[cfg(not(feature = "test-hooks"))]
+compile_error!("tests/process.rs needs the test hooks: cargo test --features test-hooks");
 
 use std::fs;
 use std::io::Read;
@@ -18,6 +22,8 @@ struct Rig {
     children: Vec<Child>,
     coord_port: String,
     coord_idx: usize,
+    /// Extra coordinator flags, applied to the first start and every restart.
+    coord_extra: Vec<String>,
 }
 
 impl Rig {
@@ -39,6 +45,7 @@ impl Rig {
             children: Vec::new(),
             coord_port: String::new(),
             coord_idx: 0,
+            coord_extra: Vec::new(),
         }
     }
 
@@ -50,6 +57,7 @@ impl Rig {
         let out = fs::File::create(self.p(stdout_name)).unwrap();
         let child = Command::new(BIN)
             .args(args)
+            .env("ROGER_TOKEN", TOKEN)
             .stdout(Stdio::from(out))
             .stderr(Stdio::from(
                 fs::File::create(self.p(&format!("{stdout_name}.err"))).unwrap(),
@@ -106,9 +114,10 @@ impl Rig {
             port_file.to_str().unwrap().into(),
             "--data".into(),
             data.to_str().unwrap().into(),
-            "--token".into(),
-            TOKEN.into(),
         ]
+        .into_iter()
+        .chain(self.coord_extra.iter().cloned())
+        .collect()
     }
 
     fn start_stack(&mut self) {
@@ -129,8 +138,6 @@ impl Rig {
                     "daemon",
                     "--coordinator",
                     &coord,
-                    "--token",
-                    TOKEN,
                     "--host-id",
                     host,
                     "--socket",
@@ -281,8 +288,6 @@ impl Rig {
             "daemon".into(),
             "--coordinator".into(),
             coord,
-            "--token".into(),
-            TOKEN.into(),
             "--host-id".into(),
             "host-b".into(),
             "--socket".into(),
@@ -1516,4 +1521,157 @@ fn relabel_of_an_unregistered_address_is_refused() {
     assert!(label(RECIPIENT).status.success());
     let coord = read(&rig.p("coord.log"));
     assert_eq!(count_lines_with(&coord, "\"ev\":\"label\""), 1, "{coord}");
+}
+
+/// Wait until the Board read through `sock` does (`want`) or does not list
+/// `id`, and return that read.
+fn wait_board_lists(rig: &Rig, sock: &str, id: &str, want: bool) -> String {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        // A board read fails outright while a host daemon is reconnecting.
+        let output = board_output(rig, sock);
+        let out = String::from_utf8_lossy(&output.stdout).to_string();
+        if output.status.success() && out.contains(&format!("SESSION address={id} ")) == want {
+            return out;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "listed={want} never held for {id}: {out}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn broadcast_from_sender(rig: &Rig, mail: &str) -> String {
+    let output = Command::new(BIN)
+        .args(["send", "--socket", rig.p("a.sock").to_str().unwrap()])
+        .args([
+            "--from", SENDER, "--to", "*", "--mail", mail, "--body", "all",
+        ])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    read(&rig.p("coord.log"))
+        .lines()
+        .find(|l| l.contains(&format!("\"ev\":\"broadcast\",\"mail\":\"{mail}\"")))
+        .unwrap_or_else(|| panic!("broadcast {mail} not committed"))
+        .to_string()
+}
+
+/// A shim closing the adapter's stdin ends the session on purpose: it leaves
+/// the Board and every later Broadcast at once, and Mail sent to its Address
+/// afterwards is still kept for it.
+#[test]
+fn adapter_stdin_eof_unregisters_at_once_and_keeps_later_mail() {
+    let mut rig = Rig::new("unregister");
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    let (idx, stdin) = rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "adapter1.out", &[]);
+    wait_board_lists(&rig, "a.sock", RECIPIENT, true);
+
+    drop(stdin);
+    rig.children[idx].wait().unwrap();
+    wait_board_lists(&rig, "a.sock", RECIPIENT, false);
+    let coord = read(&rig.p("coord.log"));
+    assert_eq!(
+        count_lines_with(
+            &coord,
+            &format!("\"ev\":\"unregister\",\"session\":\"{RECIPIENT}\"")
+        ),
+        1,
+        "{coord}"
+    );
+    let b = broadcast_from_sender(&rig, "b-after");
+    assert!(!b.contains(RECIPIENT), "{b}");
+    assert!(b.contains(SENDER), "{b}");
+
+    rig.send("m-after", "kept for a later Register");
+    rig.start_adapter("b.sock", RECIPIENT, "adapter.store", "adapter2.out", &[]);
+    wait_for_text(
+        &rig.p("adapter2.out"),
+        "\"mail\":\"m-after\"",
+        Duration::from_secs(10),
+    );
+}
+
+/// A session that dies without unregistering stays registered while it is
+/// disconnected for less than the coordinator's `--unregister-after-ms`; the
+/// first registered-set read after that unregisters it. A connected session
+/// never expires, including across a coordinator restart, and no Mail is lost.
+#[test]
+fn a_dead_session_is_unregistered_after_its_grace_and_keeps_its_mail() {
+    let mut rig = Rig::new("unregister-grace");
+    rig.coord_extra = vec!["--unregister-after-ms".into(), "600".into()];
+    rig.start_stack();
+    rig.register("a.sock", SENDER);
+    let recipient = rig.start_recipient("recipient1.out", false);
+    rig.kill(recipient);
+    wait_connected(&rig, "a.sock", false);
+    rig.send("m-grace", "sent while it is dead");
+
+    std::thread::sleep(Duration::from_millis(700));
+    let out = wait_board_lists(&rig, "a.sock", RECIPIENT, false);
+    assert!(out.contains(&format!("SESSION address={SENDER} ")), "{out}");
+    let b = broadcast_from_sender(&rig, "b-grace");
+    assert!(!b.contains(RECIPIENT) && b.contains(SENDER), "{b}");
+
+    // A restarted coordinator counts replayed sessions from its start; the
+    // live one re-registers through its host daemon and stays.
+    rig.restart_coordinator();
+    std::thread::sleep(Duration::from_millis(700));
+    wait_board_lists(&rig, "a.sock", SENDER, true);
+
+    rig.start_recipient("recipient2.out", false);
+    wait_for_text(
+        &rig.p("recipient2.out"),
+        "DELIVERED mail=m-grace",
+        Duration::from_secs(10),
+    );
+}
+
+/// Two processes on one Store would number records from the same replay; the
+/// second is refused at start and the first keeps serving.
+#[test]
+fn a_second_session_on_one_store_is_refused() {
+    let mut rig = Rig::new("store-lock");
+    rig.start_stack();
+    rig.start_recipient("recipient1.out", false);
+    let mut second = Command::new(BIN)
+        .args(["session", "--socket", rig.p("b.sock").to_str().unwrap()])
+        .args([
+            "--id",
+            IDLE,
+            "--store",
+            rig.p("recipient.store").to_str().unwrap(),
+        ])
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = second.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = second.kill();
+            panic!("a second session on one Store kept running");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    second
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    assert!(!status.success(), "{status:?}");
+    assert!(err.contains("held by another process"), "{err}");
+    rig.send("m-lock", "still served");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "DELIVERED mail=m-lock record=r-1",
+        Duration::from_secs(10),
+    );
 }

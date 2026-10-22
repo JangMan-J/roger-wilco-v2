@@ -7,9 +7,15 @@ use crate::durlog::DurLog;
 use crate::json::{self, obj, s, Value};
 use crate::net;
 use std::collections::HashMap;
-use std::io::{self, Write};
+use std::io::{self, Read as _, Write};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
+
+/// Test hook (feature `test-hooks` only): when set, the first delivery is
+/// written to the Store, the marker file is created, and the session parks
+/// before its ack until killed. On restart the marker exists and it acks.
+#[cfg(feature = "test-hooks")]
+pub static HOLD_BEFORE_ACK: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
 /// The Tracer: a session with no harness, reporting on its own stdout.
 pub fn run(
@@ -17,18 +23,9 @@ pub fn run(
     id: String,
     label: Option<String>,
     store_path: PathBuf,
-    hold_before_ack: Option<PathBuf>,
     declared: Option<String>,
 ) -> io::Result<()> {
-    serve(
-        socket,
-        id,
-        label,
-        store_path,
-        hold_before_ack,
-        declared,
-        None,
-    )
+    serve(socket, id, label, store_path, declared, None)
 }
 
 /// The adapter: the same session, fronted by one line-delimited JSON stream
@@ -41,16 +38,20 @@ pub fn run(
 /// line follows the Store write and never gates the ack: the shim renders
 /// what the adapter already holds and acknowledges nothing.
 /// `declared` is the shim's opaque self-description, sent with Register.
+/// When the shim's stdin closes, the session unregisters and the process exits.
 pub fn adapter(
     socket: PathBuf,
     id: String,
     label: Option<String>,
     store_path: PathBuf,
-    hold_before_ack: Option<PathBuf>,
     declared: Option<String>,
 ) -> io::Result<()> {
     let out = net::writer(Box::new(io::stdout()));
-    let (sock, me, to_shim) = (socket.clone(), id.clone(), out.clone());
+    serve(socket, id, label, store_path, declared, Some(out))
+}
+
+/// The adapter's shim side, started once the session has registered.
+fn shim_io(socket: PathBuf, me: String, to_shim: net::Writer, daemon: net::Writer) {
     // A send blocks until the core answers, so sends run on a worker, one at a
     // time and in order (a shim pairs replies to sends by order). The reader
     // below only reads stdin, so the shim's EOF ends this process at once even
@@ -58,7 +59,7 @@ pub fn adapter(
     let (tx, rx) = std::sync::mpsc::channel::<io::Result<Value>>();
     std::thread::spawn(move || {
         for line in rx {
-            let reply = line.and_then(|v| shim_request(&sock, &me, &v));
+            let reply = line.and_then(|v| shim_request(&socket, &me, &v));
             let _ = net::send(
                 &to_shim,
                 &reply.unwrap_or_else(|e| {
@@ -73,18 +74,12 @@ pub fn adapter(
                 break;
             }
         }
-        // The shim's stdin closed: its harness is gone, so this session is too.
+        // The shim's stdin closed: its harness is gone, so this session is
+        // too. It leaves the Board and every later Broadcast now; Mail already
+        // accepted for its Address stays pending at the coordinator.
+        let _ = net::send(&daemon, &obj(vec![("type", s("unregister"))]));
         std::process::exit(0);
     });
-    serve(
-        socket,
-        id,
-        label,
-        store_path,
-        hold_before_ack,
-        declared,
-        Some(out),
-    )
 }
 
 fn shim_request(socket: &PathBuf, me: &str, v: &Value) -> io::Result<Value> {
@@ -156,7 +151,6 @@ fn serve(
     id: String,
     label: Option<String>,
     store_path: PathBuf,
-    hold_before_ack: Option<PathBuf>,
     declared: Option<String>,
     shim: Option<net::Writer>,
 ) -> io::Result<()> {
@@ -183,7 +177,10 @@ fn serve(
     }
     net::send(&writer, &obj(register))?;
     match &shim {
-        Some(w) => net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?,
+        Some(w) => {
+            net::send(w, &obj(vec![("type", s("ready")), ("session", s(&id))]))?;
+            shim_io(socket, id.clone(), w.clone(), writer.clone());
+        }
         None => {
             println!("READY session={id}");
             io::stdout().flush()?;
@@ -232,11 +229,10 @@ fn serve(
                         ]),
                     )?;
                 }
-                if let Some(marker) = &hold_before_ack {
+                #[cfg(feature = "test-hooks")]
+                if let Some(marker) = HOLD_BEFORE_ACK.get() {
                     if !marker.exists() {
                         std::fs::write(marker, "held\n")?;
-                        // Test hook: sit between store write and ack until
-                        // killed. On restart the marker exists and we ack.
                         loop {
                             std::thread::park();
                         }
@@ -449,5 +445,3 @@ pub fn gen_uuid() -> io::Result<String> {
         b[14], b[15]
     ))
 }
-
-use std::io::Read as _;

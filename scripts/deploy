@@ -52,6 +52,7 @@ git -C "$ROOT" archive "$commit" | tar -x -C "$work/src"
 (cd "$work/src" && CARGO_TARGET_DIR="$work/target" RUSTFLAGS="--remap-path-prefix=$work/src=/roger" \
   cargo build --release --offline -q)
 bin="$work/target/release/roger"
+! grep -q -- --hold-before-ack "$bin" || die "the build carries the test hooks; deploy builds without features"
 sum="$(sha256sum "$bin" | cut -d' ' -f1)"
 printf 'commit=%s\nsha256=%s\n' "$commit" "$sum" >"$work/deployed"
 echo "deploy $host: commit $commit sha256 $sum"

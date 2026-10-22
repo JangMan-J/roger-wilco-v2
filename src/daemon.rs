@@ -221,45 +221,33 @@ fn upstream_once(cfg: &Config, state: &Arc<Mutex<State>>) -> io::Result<()> {
         let v = line?;
         match net::field(&v, "type")? {
             "deliver" => handle_deliver(state, &v)?,
-            "acked" => {
-                let waiter = v
-                    .get("req")
-                    .and_then(|x| x.as_i64())
-                    .and_then(|req| state.lock().unwrap().waiters.remove(&req));
-                if let Some(tx) = waiter {
-                    let _ = tx.send(v.clone());
-                }
+            // Every other line answers one request, by its req.
+            kind => {
                 // Upstream has this receipt now, so it leaves the replay list.
-                if let Ok(mail) = net::field(&v, "mail") {
-                    let mail = mail.to_string();
-                    state.lock().unwrap().receipts.retain(|r| r.mail != mail);
-                }
-            }
-            "error" => {
-                let waiter = v
-                    .get("req")
-                    .and_then(|x| x.as_i64())
-                    .and_then(|req| state.lock().unwrap().waiters.remove(&req));
-                if let Some(tx) = waiter {
-                    let _ = tx.send(v.clone());
-                } else if let Ok(mail) = net::field(&v, "mail") {
-                    // A replayed receipt upstream refuses stays queued, so say
-                    // so: silence here would look like a confirmed receipt.
-                    eprintln!(
-                        "upstream refused the replayed receipt for {mail}: {}",
-                        net::field(&v, "reason").unwrap_or("unexplained")
-                    );
-                }
-            }
-            "accepted" | "claim_result" | "board" | "relabeled" => {
-                if let Some(req) = v.get("req").and_then(|x| x.as_i64()) {
-                    let waiter = state.lock().unwrap().waiters.remove(&req);
-                    if let Some(tx) = waiter {
-                        let _ = tx.send(v);
+                if kind == "acked" {
+                    if let Ok(mail) = net::field(&v, "mail") {
+                        let mail = mail.to_string();
+                        state.lock().unwrap().receipts.retain(|r| r.mail != mail);
                     }
                 }
+                let waiter = v
+                    .get("req")
+                    .and_then(|x| x.as_i64())
+                    .and_then(|req| state.lock().unwrap().waiters.remove(&req));
+                match waiter {
+                    Some(tx) => {
+                        let _ = tx.send(v);
+                    }
+                    // A replayed receipt upstream refuses stays queued, so say
+                    // so: silence here would look like a confirmed receipt.
+                    None if kind == "error" => eprintln!(
+                        "upstream refused the replayed receipt for {}: {}",
+                        net::field(&v, "mail").unwrap_or("?"),
+                        net::field(&v, "reason").unwrap_or("unexplained")
+                    ),
+                    None => {}
+                }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -362,36 +350,34 @@ fn serve_local(conn: UnixStream, state: Arc<Mutex<State>>) -> io::Result<()> {
     let result = local_loop(&writer, lines, &state, &mut session_id);
     // Whatever ended the connection, a dead Writer must not stay registered:
     // the daemon would re-register that session upstream and push pending
-    // mail to a closed socket.
-    // Only this connection's own registration is removed: a session that
-    // re-registered on a newer connection is still connected.
+    // mail to a closed socket. The connection closing is the committed event
+    // that ends its presence.
     if let Some(id) = session_id {
-        let upstream = {
-            let mut st = state.lock().unwrap();
-            if st
-                .sessions
-                .get(&id)
-                .is_some_and(|w| Arc::ptr_eq(w, &writer))
-            {
-                st.sessions.remove(&id);
-                st.declared.remove(&id);
-                st.upstream.clone()
-            } else {
-                None
-            }
-        };
-        // The session's connection closing is the committed event that ends
-        // its presence. With no upstream there is nothing to tell: the
-        // coordinator marked this host's sessions disconnected when the link
-        // dropped, and the reconnect re-registers only live ones.
-        if let Some(up) = upstream {
-            let _ = net::send(
-                &up,
-                &obj(vec![("type", s("disconnect")), ("session", s(&id))]),
-            );
-        }
+        release(&state, &writer, &id, "disconnect");
     }
     result
+}
+
+/// Drop this connection's registration of `id` locally and tell the
+/// coordinator `kind` (`disconnect` or `unregister`). Only this connection's
+/// own registration is removed: a session that re-registered on a newer
+/// connection is still connected. With no upstream there is nothing to tell:
+/// the coordinator marked this host's sessions disconnected when the link
+/// dropped, and the reconnect re-registers only live ones.
+fn release(state: &Arc<Mutex<State>>, writer: &Writer, id: &str, kind: &str) {
+    let upstream = {
+        let mut st = state.lock().unwrap();
+        if st.sessions.get(id).is_some_and(|w| Arc::ptr_eq(w, writer)) {
+            st.sessions.remove(id);
+            st.declared.remove(id);
+            st.upstream.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(up) = upstream {
+        let _ = net::send(&up, &obj(vec![("type", s(kind)), ("session", s(id))]));
+    }
 }
 
 fn local_loop(
@@ -439,6 +425,12 @@ fn local_loop(
                 }
                 for p in pending {
                     let _ = net::send(writer, &p);
+                }
+            }
+            // The session is leaving on purpose: no disconnect follows.
+            "unregister" => {
+                if let Some(id) = session_id.take() {
+                    release(state, writer, &id, "unregister");
                 }
             }
             "send" => {
@@ -545,15 +537,7 @@ fn local_loop(
                 if let Value::Obj(pairs) = &mut upstream {
                     pairs.retain(|(k, _)| k != "req");
                 }
-                let mut resp = upstream_request(state, upstream)?;
-                if let Value::Obj(pairs) = &mut resp {
-                    for (k, val) in pairs.iter_mut() {
-                        if k == "req" {
-                            *val = Value::Int(req);
-                        }
-                    }
-                }
-                net::send(writer, &resp)?;
+                net::send(writer, &with_req(upstream_request(state, upstream)?, req))?;
             }
             other => {
                 return Err(io::Error::new(

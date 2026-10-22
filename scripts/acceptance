@@ -59,23 +59,24 @@ two_host_stack() {
   ts_ip="$(tailscale ip -4 2>/dev/null | head -n1)"
   [[ -n "$ts_ip" ]] || fail "no tailnet IPv4 on this host"
 
-  (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
   bin="$ROOT/target/release/roger"
 
   local token
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
   remote_work="/tmp/roger-accept.$$"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
 
   trap cleanup EXIT
 
   "$bin" coordinator --bind "$ts_ip:0" --port-file "$work/port" \
-    --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
+    --data "$work/coord.log" >"$work/coord.out" 2>&1 &
   coord_pid=$!
   wait_for 10 "coordinator port file" test -s "$work/port"
   coord="$ts_ip:$(cat "$work/port")"
 
-  "$bin" daemon --coordinator "$coord" --token "$token" \
+  "$bin" daemon --coordinator "$coord" \
     --host-id decent-spider --socket "$work/a.sock" --data "$work/a.log" \
     >"$work/daemon-a.out" 2>&1 &
   daemon_pid=$!
@@ -88,7 +89,7 @@ two_host_stack() {
   scp -q "$bin" "$REMOTE_HOST:$remote_work/roger" || fail "scp binary"
 
   remote_spawn daemon.pid daemon.out \
-    "./roger daemon --coordinator $coord --token $token --host-id agent-jail --socket $remote_work/b.sock --data $remote_work/b.log" \
+    "ROGER_TOKEN=$token ./roger daemon --coordinator $coord --host-id agent-jail --socket $remote_work/b.sock --data $remote_work/b.log" \
     || fail "start remote daemon"
   wait_for 15 "remote daemon socket" ssh -n "$REMOTE_HOST" "test -S $remote_work/b.sock"
 }
@@ -155,20 +156,21 @@ bin=""
 coord=""
 token=""
 loopback_stack() {
-  (cd "$ROOT" && cargo build --release --offline -q) || fail "cargo build"
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
   bin="$ROOT/target/release/roger"
   local h
   work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
   token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
   trap cleanup EXIT
 
   "$bin" coordinator --bind 127.0.0.1:0 --port-file "$work/port" \
-    --data "$work/coord.log" --token "$token" >"$work/coord.out" 2>&1 &
+    --data "$work/coord.log" >"$work/coord.out" 2>&1 &
   coord_pid=$!
   wait_for 10 "coordinator port file" test -s "$work/port"
   coord="127.0.0.1:$(cat "$work/port")"
   for h in a b; do
-    "$bin" daemon --coordinator "$coord" --token "$token" --host-id "host-$h" \
+    "$bin" daemon --coordinator "$coord" --host-id "host-$h" \
       --socket "$work/$h.sock" --data "$work/$h.log" >"$work/daemon-$h.out" 2>&1 &
     pids+=("$!")
     wait_for 10 "daemon $h socket" test -S "$work/$h.sock"
@@ -657,7 +659,7 @@ references() {
 
   # The label survives a coordinator restart with the same bytes.
   kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
-  "$bin" coordinator --bind "$coord" --data "$work/coord.log" --token "$token" \
+  "$bin" coordinator --bind "$coord" --data "$work/coord.log" \
     >"$work/coord2.out" 2>&1 &
   coord_pid=$!
   wait_for 10 "board after coordinator restart" "$bin" board --socket "$work/b.sock"

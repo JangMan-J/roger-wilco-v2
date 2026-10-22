@@ -18,19 +18,41 @@ fn need(args: &[String], name: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
 }
 
+/// The fleet token, from the environment: a command line is world-readable
+/// through `ps`, a process's environment is not.
+fn token() -> io::Result<String> {
+    std::env::var("ROGER_TOKEN")
+        .ok()
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing ROGER_TOKEN"))
+}
+
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
+    #[cfg(feature = "test-hooks")]
+    if let Some(marker) = arg(&args, "--hold-before-ack") {
+        let _ = session::HOLD_BEFORE_ACK.set(marker.into());
+    }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
     match cmd {
         "coordinator" => coordinator::run(
             &need(&args, "--bind")?,
             arg(&args, "--port-file").map(PathBuf::from),
             PathBuf::from(need(&args, "--data")?),
-            need(&args, "--token")?,
+            token()?,
+            match arg(&args, "--unregister-after-ms") {
+                Some(ms) => ms.parse().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!("--unregister-after-ms expects milliseconds, saw {ms}"),
+                    )
+                })?,
+                None => coordinator::UNREGISTER_AFTER_MS,
+            },
         ),
         "daemon" => daemon::run(daemon::Config {
             coordinator: need(&args, "--coordinator")?,
-            token: need(&args, "--token")?,
+            token: token()?,
             host_id: need(&args, "--host-id")?,
             socket: PathBuf::from(need(&args, "--socket")?),
             data: PathBuf::from(need(&args, "--data")?),
@@ -43,7 +65,6 @@ fn main() -> io::Result<()> {
             },
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
-            arg(&args, "--hold-before-ack").map(PathBuf::from),
             arg(&args, "--declare"),
         ),
         "adapter" => session::adapter(
@@ -54,7 +75,6 @@ fn main() -> io::Result<()> {
             },
             arg(&args, "--label"),
             PathBuf::from(need(&args, "--store")?),
-            arg(&args, "--hold-before-ack").map(PathBuf::from),
             arg(&args, "--declare"),
         ),
         "send" => session::send(

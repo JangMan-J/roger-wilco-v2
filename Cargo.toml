@@ -9,5 +9,9 @@ path = "src/main.rs"
 
 [dependencies]
 
+[features]
+# Test-only hooks (`--hold-before-ack`); release and deploy builds leave them out.
+test-hooks = []
+
 [lints.clippy]
 all = "warn"

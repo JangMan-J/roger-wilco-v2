@@ -6,10 +6,11 @@ After=roger-coordinator.service
 StartLimitIntervalSec=0
 
 [Service]
+# Carries ROGER_TOKEN into the environment, where the core reads it; argv shows in ps.
 EnvironmentFile=%h/.config/roger/env
 RuntimeDirectory=roger
 RuntimeDirectoryMode=0700
-ExecStart=%h/.local/bin/roger daemon --coordinator ${ROGER_COORDINATOR} --token ${ROGER_TOKEN} --host-id ${ROGER_HOST_ID} --socket %t/roger/daemon.sock --data %h/.local/share/roger/daemon.log
+ExecStart=%h/.local/bin/roger daemon --coordinator ${ROGER_COORDINATOR} --host-id ${ROGER_HOST_ID} --socket %t/roger/daemon.sock --data %h/.local/share/roger/daemon.log
 Restart=always
 RestartSec=3
 

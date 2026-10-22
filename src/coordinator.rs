@@ -2,7 +2,10 @@
 //! receipts. Host daemons connect to it; committed mail is pushed to the
 //! recipient's host daemon, and pending mail is pushed when a session or
 //! host (re)registers. Claims are decided against their committed deadlines
-//! at the moment of each request or board read. Nothing here scans on a timer.
+//! at the moment of each request or board read, and a session's registration
+//! ends by its own unregister or, once it has been disconnected for
+//! `unregister_after_ms`, at the next request that reads the registered set.
+//! Nothing here scans on a timer.
 
 use crate::claims::{Change, Claims, Held, Op};
 use crate::durlog::DurLog;
@@ -33,12 +36,26 @@ pub const BROADCAST: &str = "*";
 /// recipient.
 const COPY_SEP: char = '/';
 
+/// How long a registered session may stay disconnected before it is
+/// unregistered: longer than a host daemon or coordinator restart takes.
+pub const UNREGISTER_AFTER_MS: i64 = 300_000;
+
+/// One registered session.
+struct Session {
+    host: String,
+    /// Display text, stored verbatim; empty until a Register or relabel names one.
+    label: String,
+    /// Opaque text the session declared at its latest Register, verbatim.
+    declared: Option<String>,
+}
+
 struct State {
     log: DurLog,
-    sessions: HashMap<String, String>, // session -> host
-    labels: HashMap<String, String>,   // session -> label, stored verbatim
-    /// Opaque text each session declared at its latest Register, verbatim.
-    declared: HashMap<String, String>,
+    sessions: HashMap<String, Session>,
+    /// When this coordinator started: a replayed session that never
+    /// re-registers counts as disconnected from then.
+    started: i64,
+    unregister_after_ms: i64,
     /// Presence: when each Address last acted (register, send, a live ack, a
     /// Board read naming it) or disconnected, on the coordinator clock. Set at
     /// the moment of the event and only read by the Board; memory only, since
@@ -73,13 +90,19 @@ fn now_ms() -> i64 {
         .unwrap_or(0)
 }
 
-pub fn run(bind: &str, port_file: Option<PathBuf>, data: PathBuf, token: String) -> io::Result<()> {
+pub fn run(
+    bind: &str,
+    port_file: Option<PathBuf>,
+    data: PathBuf,
+    token: String,
+    unregister_after_ms: i64,
+) -> io::Result<()> {
     let (log, prior) = DurLog::open(&data)?;
     let mut state = State {
         log,
         sessions: HashMap::new(),
-        labels: HashMap::new(),
-        declared: HashMap::new(),
+        started: now_ms(),
+        unregister_after_ms,
         seen: HashMap::new(),
         connected: HashSet::new(),
         mails: HashMap::new(),
@@ -132,20 +155,38 @@ fn apply(state: &mut State, v: &Value) -> io::Result<()> {
     match v.get("ev").and_then(|x| x.as_str()) {
         Some("session") => {
             if let (Ok(session), Ok(host)) = (net::field(v, "session"), net::field(v, "host")) {
-                state.sessions.insert(session.to_string(), host.to_string());
+                state
+                    .sessions
+                    .entry(session.to_string())
+                    .and_modify(|s| s.host = host.to_string())
+                    .or_insert_with(|| Session {
+                        host: host.to_string(),
+                        label: String::new(),
+                        declared: None,
+                    });
+            }
+        }
+        Some("unregister") => {
+            if let Ok(session) = net::field(v, "session") {
+                state.sessions.remove(session);
             }
         }
         Some("declared") => {
-            if let Ok(session) = net::field(v, "session") {
-                match net::declared_of(v) {
-                    Some(d) => state.declared.insert(session.to_string(), d),
-                    None => state.declared.remove(session),
-                };
+            if let Some(s) = net::field(v, "session")
+                .ok()
+                .and_then(|a| state.sessions.get_mut(a))
+            {
+                s.declared = net::declared_of(v);
             }
         }
         Some("label") => {
-            if let (Ok(session), Ok(label)) = (net::field(v, "session"), net::field(v, "label")) {
-                state.labels.insert(session.to_string(), label.to_string());
+            if let (Some(s), Ok(label)) = (
+                net::field(v, "session")
+                    .ok()
+                    .and_then(|a| state.sessions.get_mut(a)),
+                net::field(v, "label"),
+            ) {
+                s.label = label.to_string();
             }
         }
         Some("mail") => {
@@ -209,14 +250,59 @@ fn stamp(st: &mut State, session: &str) {
 /// Record a session's label verbatim. The label is display only: it never
 /// touches the session's Address, host, or pending mail.
 fn set_label(state: &mut State, session: &str, label: &str) -> io::Result<()> {
-    let ev = obj(vec![
-        ("ev", s("label")),
-        ("session", s(session)),
-        ("label", s(label)),
-    ]);
+    commit(
+        state,
+        obj(vec![
+            ("ev", s("label")),
+            ("session", s(session)),
+            ("label", s(label)),
+        ]),
+    )
+}
+
+/// Append one event durably, then apply it to memory: the one path every
+/// session event takes, so replay and live state agree.
+fn commit(state: &mut State, ev: Value) -> io::Result<()> {
     state.log.append(&json::stringify(&ev))?;
-    state.labels.insert(session.to_string(), label.to_string());
+    apply(state, &ev)
+}
+
+/// End one session's registration: it leaves the Board and every later
+/// Broadcast. Mail already accepted for its Address stays pending and is
+/// delivered if that Address registers again.
+fn unregister(st: &mut State, session: &str) -> io::Result<()> {
+    commit(
+        st,
+        obj(vec![("ev", s("unregister")), ("session", s(session))]),
+    )?;
+    st.connected.remove(session);
+    st.seen.remove(session);
     Ok(())
+}
+
+/// Unregister every session disconnected for `unregister_after_ms`, read
+/// against now. Called by each request that reads the registered set
+/// (Broadcast, Board, claim, relabel), as claim expiry is: no timer runs it.
+fn expire(st: &mut State) -> io::Result<()> {
+    let cutoff = now_ms() - st.unregister_after_ms;
+    let mut gone: Vec<String> = st
+        .sessions
+        .keys()
+        .filter(|a| {
+            !st.connected.contains(*a)
+                && st.seen.get(*a).copied().unwrap_or(0).max(st.started) <= cutoff
+        })
+        .cloned()
+        .collect();
+    gone.sort();
+    for a in gone {
+        unregister(st, &a)?;
+    }
+    Ok(())
+}
+
+fn host_of<'a>(state: &'a State, session: &str) -> Option<&'a str> {
+    state.sessions.get(session).map(|s| s.host.as_str())
 }
 
 /// Pending deliveries for sessions on `host`, or for one session.
@@ -231,7 +317,7 @@ fn pending_pushes(state: &State, host: &str, only_session: Option<&str>) -> Vec<
             if m.to != want {
                 continue;
             }
-        } else if state.sessions.get(&m.to).map(|h| h.as_str()) != Some(host) {
+        } else if host_of(state, &m.to) != Some(host) {
             continue;
         }
         out.push(net::deliver_msg(id, &m.from, &m.to, &m.body, m.wake));
@@ -282,27 +368,24 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                     let mut st = state.lock().unwrap();
                     st.seen.insert(session.clone(), now_ms());
                     st.connected.insert(session.clone());
-                    if st.sessions.get(&session).map(|h| h.as_str()) != Some(host.as_str()) {
+                    if host_of(&st, &session) != Some(host.as_str()) {
                         let ev = obj(vec![
                             ("ev", s("session")),
                             ("session", s(&session)),
                             ("host", s(&host)),
                         ]);
-                        st.log.append(&json::stringify(&ev))?;
-                        st.sessions.insert(session.clone(), host.clone());
+                        commit(&mut st, ev)?;
                     }
                     if let Some(label) = v.get("label").and_then(|x| x.as_str()) {
                         set_label(&mut st, &session, label)?;
                     }
                     let declared = net::declared_of(&v);
-                    if st.declared.get(&session) != declared.as_ref() {
+                    if st.sessions[&session].declared != declared {
                         let mut ev = vec![("ev", s("declared")), ("session", s(&session))];
                         if let Some(d) = &declared {
                             ev.push(("declared", s(d)));
                         }
-                        let ev = obj(ev);
-                        st.log.append(&json::stringify(&ev))?;
-                        apply(&mut st, &ev)?;
+                        commit(&mut st, obj(ev))?;
                     }
                     pending_pushes(&st, &host, Some(&session))
                 };
@@ -355,8 +438,8 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                             ("body", s(&m.body)),
                         ]);
                         st.log.append(&json::stringify(&ev))?;
-                        if let Some(host_of) = st.sessions.get(&m.to).cloned() {
-                            if let Some((_, w)) = st.hosts.get(&host_of) {
+                        if let Some(h) = host_of(&st, &m.to) {
+                            if let Some((_, w)) = st.hosts.get(h) {
                                 push.push((
                                     Arc::clone(w),
                                     net::deliver_msg(&mail, &m.from, &m.to, &m.body, true),
@@ -385,8 +468,17 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let mut st = state.lock().unwrap();
                 // A session that has since registered through another host
                 // is still connected there.
-                if st.sessions.get(&session) == Some(&host) && st.connected.remove(&session) {
+                if host_of(&st, &session) == Some(host.as_str()) && st.connected.remove(&session) {
                     st.seen.insert(session, now_ms());
+                }
+            }
+            // The session left on purpose: its registration ends now, unless
+            // it has since registered through another host.
+            "unregister" => {
+                let session = net::field(&v, "session")?.to_string();
+                let mut st = state.lock().unwrap();
+                if host_of(&st, &session) == Some(host.as_str()) {
+                    unregister(&mut st, &session)?;
                 }
             }
             "relabel" => {
@@ -395,6 +487,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
                 let label = net::field(&v, "label")?.to_string();
                 let reply = {
                     let mut st = state.lock().unwrap();
+                    expire(&mut st)?;
                     // A label belongs to a session: an Address that never
                     // registered gets none, so no label can be parked on it.
                     if st.sessions.contains_key(&session) {
@@ -475,6 +568,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             "claim" => {
                 let reply = {
                     let mut st = state.lock().unwrap();
+                    expire(&mut st)?;
                     claim(&mut st, &v)?
                 };
                 net::send(&writer, &reply)?;
@@ -482,6 +576,7 @@ fn serve(conn: std::net::TcpStream, state: Arc<Mutex<State>>, token: &str) -> io
             "board" => {
                 let reply = {
                     let mut st = state.lock().unwrap();
+                    expire(&mut st)?;
                     // A Board read that names its reader is that session's own
                     // activity.
                     if let Ok(reader) = net::field(&v, "session") {
@@ -526,7 +621,7 @@ impl Drop for HostLink {
         let gone: Vec<String> = st
             .sessions
             .iter()
-            .filter(|(a, h)| **h == self.host && st.connected.contains(*a))
+            .filter(|(a, s)| s.host == self.host && st.connected.contains(*a))
             .map(|(a, _)| a.clone())
             .collect();
         for a in gone {
@@ -617,18 +712,15 @@ fn claim(st: &mut State, v: &Value) -> io::Result<Value> {
 fn board(st: &State, v: &Value) -> Value {
     let req = v.get("req").and_then(|x| x.as_i64()).unwrap_or(0);
     let now = now_ms();
-    let mut sessions: Vec<(&String, &String)> = st.sessions.iter().collect();
-    sessions.sort();
+    let mut sessions: Vec<(&String, &Session)> = st.sessions.iter().collect();
+    sessions.sort_by_key(|(a, _)| *a);
     let sessions = sessions
         .into_iter()
-        .map(|(session, host)| {
+        .map(|(session, row)| {
             let mut pairs = vec![
                 ("session", s(session)),
-                ("host", s(host)),
-                (
-                    "label",
-                    s(st.labels.get(session).map(String::as_str).unwrap_or("")),
-                ),
+                ("host", s(&row.host)),
+                ("label", s(&row.label)),
                 ("connected", Value::Bool(st.connected.contains(session))),
                 (
                     "last_seen_ms",
@@ -639,7 +731,7 @@ fn board(st: &State, v: &Value) -> Value {
                     }),
                 ),
             ];
-            if let Some(d) = st.declared.get(session) {
+            if let Some(d) = &row.declared {
                 pairs.push(("declared", s(d)));
             }
             obj(pairs)
@@ -709,6 +801,7 @@ fn broadcast(
     if st.broadcasts.contains(mail) {
         return Ok(Vec::new());
     }
+    expire(st)?;
     let mut to: Vec<String> = st.sessions.keys().cloned().collect();
     to.sort();
     let ev = obj(vec![
@@ -722,8 +815,7 @@ fn broadcast(
     fan_out(st, mail, from, body, &to);
     let mut push = Vec::new();
     for addr in &to {
-        let host = st.sessions.get(addr);
-        if let Some((_, w)) = host.and_then(|h| st.hosts.get(h)) {
+        if let Some((_, w)) = host_of(st, addr).and_then(|h| st.hosts.get(h)) {
             push.push((
                 Arc::clone(w),
                 net::deliver_msg(&copy_id(mail, addr), from, addr, body, false),

@@ -2,6 +2,11 @@
 //! it returns. Replay yields complete lines only; a trailing fragment left
 //! by a crash mid-append is dropped.
 //!
+//! The file is locked exclusively for as long as the log is open, so a
+//! second process (a second adapter on one Store, a second daemon or
+//! coordinator on one data file) fails at open instead of numbering records
+//! from the same replay. The kernel drops the lock when the process dies.
+//!
 //! One failed append poisons the log: the bytes may have reached the disk
 //! even though the caller saw an error and left memory unchanged, so no
 //! later append may commit on top of that split. Every later append returns
@@ -26,10 +31,23 @@ impl DurLog {
             }
         }
         let existed = path.exists();
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .append(true)
+            .open(path)?;
+        // no-poll: one attempt, never retried; a held lock is an error.
+        file.try_lock().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::WouldBlock,
+                format!(
+                    "expected {} unlocked, saw it held by another process: {e}",
+                    path.display()
+                ),
+            )
+        })?;
         let mut bytes = Vec::new();
-        if existed {
-            File::open(path)?.read_to_end(&mut bytes)?;
-        }
+        file.read_to_end(&mut bytes)?;
         // A crash mid-append leaves a fragment with no terminating newline.
         // Drop it from the file, not just from the replay: an append in
         // append mode would otherwise glue onto it and corrupt a record.
@@ -38,10 +56,7 @@ impl DurLog {
             None => 0,
         };
         if keep < bytes.len() {
-            std::fs::OpenOptions::new()
-                .write(true)
-                .open(path)?
-                .set_len(keep as u64)?;
+            file.set_len(keep as u64)?;
             bytes.truncate(keep);
         }
         let text = String::from_utf8_lossy(&bytes);
@@ -50,10 +65,6 @@ impl DurLog {
             .filter(|l| !l.is_empty())
             .map(|l| l.to_string())
             .collect();
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)?;
         if !existed {
             // Make the new file itself durable.
             if let Some(parent) = path.parent() {
@@ -140,6 +151,17 @@ mod tests {
         let msg = second.to_string();
         assert!(msg.contains("poisoned"), "{msg}");
         assert!(msg.contains(&first.to_string()), "{msg} / {first}");
+    }
+
+    #[test]
+    fn a_second_open_of_a_held_log_fails_until_the_first_closes() {
+        let path = temp_path("lock");
+        let (first, _) = DurLog::open(&path).unwrap();
+        let err = DurLog::open(&path).err().expect("second open must fail");
+        assert!(err.to_string().contains("held by another process"), "{err}");
+        drop(first);
+        DurLog::open(&path).unwrap();
+        let _ = fs::remove_file(&path);
     }
 
     #[test]
