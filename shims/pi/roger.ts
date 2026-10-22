@@ -9,16 +9,31 @@
 // boundary. Pi decides idle or busy; the core never learns either. The shim
 // declares its wake latency to the Board as `wake-latency-ms=<n>`.
 //
-// Env: ROGER_SOCKET (host daemon socket) and ROGER_STORE (Store path) are
-// required; ROGER_SESSION is the Address (adapter generates one if unset);
-// ROGER_BIN is the adapter binary (default `roger` on PATH);
-// ROGER_WAKE_LATENCY_MS is the declared wake latency (default 1000), or `off`
-// to render Mail without ever starting a turn and declare nothing.
+// Env (an explicit, non-empty value wins; defaults in roger-env.ts):
+// ROGER_SOCKET, default $XDG_RUNTIME_DIR/roger/daemon.sock; ROGER_BIN, default
+// ~/.local/bin/roger when it exists, else `roger` on PATH; ROGER_SESSION, the
+// Address, default this Pi session's id when it is a UUID, else a fresh UUID;
+// ROGER_STORE, default
+// ${XDG_STATE_HOME:-~/.local/state}/roger-shims/pi/<address>.store. ROGER_WAKE_LATENCY_MS is the
+// declared wake latency (default 1000), or `off` to render Mail without ever
+// starting a turn and declare nothing.
+//
+// One Pi session is one Address. Resume reopens the same Pi session, so the
+// same Address and Store. /new and /fork make a new Pi session id, so a new
+// Address with its own Store: Pi emits session_shutdown first, and this shim
+// waits for the old adapter to exit before the replacement runtime's
+// session_start starts the next one. Within one runtime a recurring
+// session_start reuses the running adapter. Across Pi processes, the
+// `<store>.lock` file (holding the Pi pid) refuses a second adapter on a
+// Store whose holder is alive.
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { createInterface } from "node:readline";
 import { Type } from "@earendil-works/pi-ai";
 import { defineTool, type ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { registerRogerCommand } from "./roger-command.ts";
+import { lockStore, settings } from "./roger-env.ts";
 
 type Reply = Record<string, unknown>;
 type Pending = { ok: (reply: Reply) => void; fail: (e: Error) => void };
@@ -41,23 +56,31 @@ export default function (pi: ExtensionAPI) {
 	let why = "roger adapter is not running"; // why the last adapter is gone
 	const seen = new Set<string>(); // a redelivery after a crash shares its record id
 	const pending: Pending[] = []; // requests awaiting their reply, in order
-	let me = process.env.ROGER_SESSION ?? ""; // the Address, from the adapter's ready line
+	let me = process.env.ROGER_SESSION ?? ""; // the Address: set at start, confirmed by the adapter's ready line
 
 	const failAll = (e: Error) => {
 		for (const p of pending.splice(0)) p.fail(e);
 	};
 
-	const start = () => {
-		// session_start recurs (new, resume, fork, reload) while this process
-		// lives; a second adapter would be a second writer of the same Store.
+	let unlock: (() => void) | undefined; // releases this runtime's Store lock
+
+	const start = (sessionId: string | undefined) => {
+		// session_start may recur while this runtime lives; a second adapter
+		// would be a second writer of the same Store.
 		if (adapter) return;
-		const socket = process.env.ROGER_SOCKET;
-		const store = process.env.ROGER_STORE;
-		if (!socket || !store) throw new Error("ROGER_SOCKET and ROGER_STORE are required");
-		const args = ["adapter", "--socket", socket, "--store", store];
-		if (process.env.ROGER_SESSION) args.push("--id", process.env.ROGER_SESSION);
+		let cfg;
+		try {
+			cfg = settings(process.env, sessionId, homedir(), randomUUID);
+			unlock = lockStore(cfg.store);
+		} catch (e) {
+			why = (e as Error).message;
+			process.stderr.write(`roger shim: ${why}\n`);
+			return;
+		}
+		me = cfg.session;
+		const args = ["adapter", "--socket", cfg.socket, "--store", cfg.store, "--id", cfg.session];
 		if (wakeMs !== undefined) args.push("--declare", `wake-latency-ms=${wakeMs}`);
-		const child = spawn(process.env.ROGER_BIN ?? "roger", args, { stdio: ["pipe", "pipe", "inherit"] });
+		const child = spawn(cfg.bin, args, { stdio: ["pipe", "pipe", "inherit"] });
 		adapter = child;
 		// 'error' (spawn failure) and 'exit' both end this adapter; an unhandled
 		// 'error' would crash the harness, and a pending send would hang.
@@ -65,6 +88,8 @@ export default function (pi: ExtensionAPI) {
 			if (adapter !== child) return;
 			adapter = undefined;
 			why = e.message;
+			unlock?.();
+			unlock = undefined;
 			process.stderr.write(`roger shim: ${e.message}\n`);
 			failAll(e);
 		};
@@ -113,20 +138,26 @@ export default function (pi: ExtensionAPI) {
 		return r.mail;
 	};
 
-	pi.on("session_start", async () => start());
+	pi.on("session_start", async (_event, ctx) => start(ctx.sessionManager.getSessionId()));
 	pi.on("session_shutdown", async () => {
 		const child = adapter;
 		adapter = undefined;
 		why = "roger shim shut down";
 		failAll(new Error(why));
-		if (!child || child.exitCode !== null) return;
-		// The adapter exits when its stdin closes. Wait for it, so a session
-		// started right after never overlaps it on the same Store.
+		const release = () => {
+			unlock?.();
+			unlock = undefined;
+		};
+		if (!child || child.exitCode !== null || child.signalCode !== null) return release();
+		// The adapter exits when its stdin closes. Wait for it, SIGKILL after 3 s
+		// and wait again, so a session started right after never overlaps it on
+		// the same Store.
 		await new Promise<void>((done) => {
-			const t = setTimeout(() => (child.kill(), done()), 3000);
+			const t = setTimeout(() => child.kill("SIGKILL"), 3000);
 			child.once("exit", () => (clearTimeout(t), done()));
 			child.stdin?.end();
 		});
+		release();
 	});
 
 	registerRogerCommand(pi, { me: () => me, request, send });
