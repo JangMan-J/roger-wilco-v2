@@ -185,4 +185,4 @@ Display text the core stores and returns verbatim and never parses: either an ag
 _Example_: a session labelled `[[0:FLEET:0]] builder`; `Meteor Shower` in `[[153:Meteor Shower:7]]`.
 _Not_: an Address (a label never routes in the core; a shim may resolve a typed label to an Address before it sends), a claim key, an Opaque integer.
 _Avoid_: name, call sign, rank
-_Confirmed_: 2026-10-21, requested by the director for Jang in the roger-command-polish slice; awaiting Jang's own confirmation.
+_Confirmed_: 2026-10-22, by Jang (first requested by the director in the roger-command-polish slice, 2026-10-21).
