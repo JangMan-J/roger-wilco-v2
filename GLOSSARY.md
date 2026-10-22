@@ -1,7 +1,7 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-21T21:53:14Z
+updated: 2026-10-22T22:15:47Z
 agent: accounts/fireworks/models/deepseek-v4p1-flash-1017
 session: 01a15ba2-183a-7158-a4c7-5e136b2b5972
 ---
@@ -186,3 +186,10 @@ _Example_: a session labelled `[[0:FLEET:0]] builder`; `Meteor Shower` in `[[153
 _Not_: an Address (a label never routes in the core; a shim may resolve a typed label to an Address before it sends), a claim key, an Opaque integer.
 _Avoid_: name, call sign, rank
 _Confirmed_: 2026-10-22, by Jang (first requested by the director in the roger-command-polish slice, 2026-10-21).
+
+**Unregister**:
+The end of the registration an Agent session made by Register: its Address leaves the Board, loses Presence, and receives no later Broadcast, while every Accepted Mail for that Address stays pending and is delivered if the Address registers again. It happens explicitly, which the adapter does when its stdin closes, or once the session has been disconnected from its host daemon for `--unregister-after-ms` (default 300000), a timeout the coordinator reads at its next Broadcast, Board read, Claim or relabel, as it reads Claim expiry, and never by a Cleanup sweep.
+_Example_: a session whose adapter's stdin closes leaves the Board at once; Mail sent to its Address afterwards is Accepted and delivered when that Address registers again.
+_Not_: a disconnect (a disconnected session stays registered until its timeout), a Claim release, removal of the session's Store or its pending Mail.
+_Avoid_: deregister, logout
+_Confirmed_: 2026-10-22, Jang ("Unregister is a very reasonable function to add").
