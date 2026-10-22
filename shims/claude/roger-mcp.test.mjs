@@ -6,16 +6,22 @@ import { spawn } from "node:child_process";
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { test } from "node:test";
+import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import { createInterface } from "node:readline";
 
 const SHIM = new URL("./roger-mcp.mjs", import.meta.url).pathname;
 const MAIL = '{"type":"mail","mail":"m-1","from":"f","body":"hello","record":"r-1"}';
 
+// Every temp dir start() makes, removed after the file's tests whether or not
+// a test reached its own cleanup (a failed assertion or an exit test skips it).
+const dirs = [];
+after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+
 // Start the shim with a stand-in adapter (a shell script, or a missing path).
 function start(script, env = {}) {
 	const dir = mkdtempSync(join(tmpdir(), "roger-shim-"));
+	dirs.push(dir);
 	let bin = join(dir, "nonexistent");
 	if (script) {
 		bin = join(dir, "adapter");
@@ -51,7 +57,7 @@ function start(script, env = {}) {
 	};
 	// Request lines the scripted adapter wrote to $dir/requests (see `logged`).
 	const requests = () => (existsSync(join(dir, "requests")) ? readFileSync(join(dir, "requests"), "utf8") : "").split("\n").filter(Boolean).map((l) => JSON.parse(l));
-	return { child, rpc, reply, call, requests, exited, stderr: () => stderr, lines, cleanup: () => (child.kill(), rmSync(dir, { recursive: true })) };
+	return { child, rpc, reply, call, requests, exited, stderr: () => stderr, lines, cleanup: () => (child.kill(), rmSync(dir, { recursive: true, force: true })) };
 }
 
 // Shell for a scripted adapter: log one request line, then answer it.
