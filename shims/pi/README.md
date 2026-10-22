@@ -6,7 +6,8 @@ tool.
 
 ## Install
 
-An optional module on top of the roger core. It needs, per host:
+An optional module on top of the roger core, which [deploy/README.md](../../deploy/README.md)
+installs. It needs, per host:
 
 - the `roger` binary at `~/.local/bin/roger` (or on `PATH`)
 - the host daemon listening on `$XDG_RUNTIME_DIR/roger/daemon.sock`

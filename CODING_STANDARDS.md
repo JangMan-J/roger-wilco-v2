@@ -26,8 +26,9 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
 4. **No harness in the core.** The core names no harness, reads no harness store, and
    `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
    file outside `shims/` and `VECTORS/`: source, tests, scripts, deploy units, and
-   docs; `scripts/acceptance` alone is exempt, since proofs 2 and 5 run real
-   harnesses. `scripts/check-harness-free` is the check.
+   docs (`README.md` and `deploy/README.md` included); `scripts/acceptance` alone is
+   exempt, since proofs 2 and 5 run real harnesses by definition.
+   `scripts/check-harness-free` is the check.
 5. **No workflow.** The core stores and routes; it never decides what work exists or
    who takes it.
 
@@ -39,10 +40,9 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
   that exercises real processes, plus the narrowest unit or process test that would
   catch a regression. Match test depth to the risk the proof names.
 - Errors are `io::Result`; a failure names what was expected and what was seen.
-- Claim deadlines are wall-clock epoch milliseconds read on the coordinator (`now_ms`),
-  stored absolute so they survive a restart; a monotonic clock alone cannot. A forward
-  clock step frees keys early and a backward one extends them. Nothing in `src/` reads
-  another clock for a claim.
+- Claim deadlines are read on the coordinator's wall clock (`now_ms`), and nothing in
+  `src/` reads another clock for a claim. Why, and what a clock step does: README.md
+  `## Claims`.
 - Keep `src/main.rs` dispatch flat: add an arm, do not restructure.
 - Test-only hooks live behind the `test-hooks` feature and never reach a deploy build.
 - Vectors, not comments, record what was tried; GLOSSARY.md, not comments, defines terms.

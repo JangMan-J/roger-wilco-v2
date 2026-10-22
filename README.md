@@ -4,18 +4,33 @@ Durable mail, presence, and work claims between agent sessions on one owner's
 hosts. `KERNEL.md`, `INVARIANTS.md`, and `GLOSSARY.md` are frozen: read them
 before changing anything.
 
+This file is the core contract. Everything else is a module with its own doc:
+
+| Module | Doc |
+| --- | --- |
+| Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
+| One adapter-fronted shim per harness: install and operation | `shims/<name>/README.md` |
+| The gate and the review rules | [CODING_STANDARDS.md](CODING_STANDARDS.md) |
+
+The `roger` binary and a host daemon's socket are the whole surface for anything on top: a
+plain client (`roger send`, `roger board`), the Tracer, or an adapter-fronted shim, each
+installed separately. Where deploy puts them is in [deploy/README.md](deploy/README.md).
+
 ## Build and test
 
 ```sh
 cargo test --offline --features test-hooks   # unit seams + process seam (real coordinator, daemon, session)
-cargo build --release --offline              # what deploy ships: no test hooks
+cargo build --release --offline              # no test hooks; what deploy ships
 ```
 
 The `test-hooks` feature adds `--hold-before-ack <marker>` to `session` and `adapter` (park
 between the Store write and the Ack, for the SIGKILL window). Only tests and
-`scripts/acceptance` build with it; `scripts/deploy` refuses a binary that carries it.
+`scripts/acceptance` build with it; deploy refuses a binary that carries it
+([deploy/README.md](deploy/README.md)).
 `coordinator` and `daemon` read the fleet token from `ROGER_TOKEN` in their environment,
 never from argv, which `ps` shows to every user.
+
+## Commands
 
 One binary, no external crates. `roger` subcommands: `coordinator`,
 `daemon`, `session` (the Tracer), `adapter` (a session fronted by a stdin/stdout
@@ -65,18 +80,6 @@ in one of two ways, both committed to the coordinator log as an `unregister` eve
 Mail already accepted for an unregistered Address stays pending and is delivered if that
 Address registers again; a connected session never expires.
 
-## Deploy
-
-`scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on
-`<host>`: the release binary at `~/.local/bin/roger` (the replaced one kept as
-`roger.prev`), `~/.config/roger/env` (its `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the ssh name
-used to reach it, so a Host id matches the `clock` its Stores record), and the systemd user units in `deploy/`
-(`roger-daemon.service` on every host, `roger-coordinator.service` on the coordinator host).
-The host daemon serves `$XDG_RUNTIME_DIR/roger/daemon.sock`. That socket and the binary are
-the whole surface for anything on top: a plain client (`roger send`, `roger board`), the
-Tracer, or an adapter-fronted shim, each installed separately. Units start at boot only
-with lingering enabled (`loginctl enable-linger`).
-
 ## Claims
 
 A claim's deadline is `now + ttl_ms` on the coordinator's wall clock, in milliseconds
@@ -87,44 +90,6 @@ The holder may repeat either grant and land in the same state: `claim` by the cu
 holder is a retry-safe refresh that resets the deadline, and `renew` sets the deadline
 to `now + ttl_ms` even when that is sooner than before. One failed log append stops
 the coordinator rather than letting memory and disk diverge; a restart replays the log.
-
-## Checks
-
-`scripts/check` is the core gate every change passes before it lands on main (fmt, clippy
-with warnings denied, tests, harness-free, no-poll); it names no harness.
-`scripts/check-all` runs it and then every `shims/<name>/check` it finds. Review rules are
-in `CODING_STANDARDS.md`.
-
-```sh
-scripts/check                     # the core gate
-scripts/check-all                 # the core gate, then each shim's own check
-scripts/check-harness-free        # invariant: no harness identity anywhere in the core
-scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
-scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
-scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
-scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
-scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
-scripts/acceptance wake           # proof 5: directed mail wakes an idle session; busy queues to the turn boundary
-scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
-```
-
-`scripts/check-harness-free` covers every file outside `shims/` and `VECTORS/` (source,
-tests, scripts, deploy units, and docs, this README included), except `scripts/acceptance`,
-whose proofs 2 and 5 run real harnesses by definition. What a proof needs from a harness is
-in that shim's README.
-
-`scripts/acceptance no-poll` runs the real binaries with no sweep (the core has none; a sweep
-added later needs a switch that this check turns off). Each phase leaves one event trigger as
-the only path to its result, so removing any trigger fails it, and its idle windows fail if any
-core log grows while nobody asks.
-
-`scripts/acceptance references` reads the Board through `roger board` (proof 4) and also
-searches `src/` for any code that parses a Reference or inspects a label (invariant 3).
-
-`scripts/acceptance cross-host` runs the coordinator on this host's tailnet
-address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
-`agent-jail`), and requires SSH to that host plus `scp`. It builds release
-binaries, then removes every process and directory it created.
 
 ## Adapters
 
@@ -146,6 +111,41 @@ Wake is the shim's job; the core carries no busy or idle state. A shim that can 
 declares `wake-latency-ms=<n>` through `--declare` and acts on each delivery's `wake` flag;
 the Store write and the Ack wait for neither.
 
+## Checks
+
+Nothing lands on main until `scripts/check-all` exits 0; what each gate runs and the review
+rules are in [CODING_STANDARDS.md](CODING_STANDARDS.md).
+
+```sh
+scripts/check                     # the core gate
+scripts/check-all                 # the core gate, then each shim's own check
+scripts/check-harness-free        # invariant: no harness identity anywhere in the core
+scripts/acceptance cross-host     # proof 1: mail survives a recipient SIGKILL across hosts
+scripts/acceptance no-poll        # invariant 2: mail, receipts, claim expiry, unregister on committed events; loopback
+scripts/acceptance independence   # proof 2: sessions from two harnesses (plus a Tracer) exchange mail; loopback
+scripts/acceptance broadcast      # proof 3: one broadcast reaches every registered session once, no wake
+scripts/acceptance claims         # proof 4: claims are exclusive, renew, expire; board on both hosts
+scripts/acceptance wake           # proof 5: directed mail wakes an idle session; busy queues to the turn boundary
+scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
+```
+
+What `scripts/check-harness-free` counts as the core, and its one exemption, is review rule 4
+in [CODING_STANDARDS.md](CODING_STANDARDS.md). What a proof needs from a harness is in that
+shim's README.
+
+`scripts/acceptance no-poll` runs the real binaries with no sweep (the core has none; a sweep
+added later needs a switch that this check turns off). Each phase leaves one event trigger as
+the only path to its result, so removing any trigger fails it, and its idle windows fail if any
+core log grows while nobody asks.
+
+`scripts/acceptance references` reads the Board through `roger board` (proof 4) and also
+searches `src/` for any code that parses a Reference or inspects a label (invariant 3).
+
+`scripts/acceptance cross-host` runs the coordinator on this host's tailnet
+address, one host daemon here and one on `$ROGER_REMOTE_HOST` (default
+`agent-jail`), and requires SSH to that host plus `scp`. It builds release
+binaries, then removes every process and directory it created.
+
 ## Layout
 
 | Path | Role |
@@ -154,7 +154,9 @@ the Store write and the Ack wait for neither.
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
 | `src/daemon.rs` | one per host; local inbox; serves sessions on a Unix socket |
 | `src/session.rs` | contract-shaped agent session (Tracer) and adapter; writes its Store, then acks |
-| `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
 | `src/durlog.rs` | append-only fsynced log; replay drops a crash-truncated tail |
 | `src/json.rs`, `src/net.rs` | one-object-per-line codec |
 | `tests/process.rs` | process seam, including the SIGKILL window |
+| `scripts/` | gates (`check`, `check-all`, `check-*`), `acceptance`, `deploy` |
+| `deploy/` | systemd user units and [deploy/README.md](deploy/README.md) |
+| `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
