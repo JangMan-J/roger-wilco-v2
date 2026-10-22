@@ -99,6 +99,20 @@ A shim keeps its own state (its Stores); back that up per its README.
 6. `ps` shows no token for the coordinator or a daemon, and
    `grep -c -- --hold-before-ack ~/.local/bin/roger` prints 0.
 
+## Copies and tests
+
+A copy of this project (a clone, worktree or other checkout), a test, or `scripts/acceptance`
+must not run with the live env. `~/.config/roger/env` holds the fleet token and the live
+coordinator address: a process given them joins the live fleet as this host. Start a copy's
+coordinator and daemons with a token of its own, a loopback `--bind`, and a `--socket` and
+`--data` under the copy's own temp directory, as `tests/process.rs` and `scripts/acceptance`
+do; `scripts/acceptance` unsets every inherited `ROGER_*` variable that names a token,
+coordinator, host, socket, Store, session or binary. `scripts/deploy` is the one script that
+reads the live env; run it only for a commit on main (Procedure), never to try out a copy.
+
+A daemon started on the live socket path by mistake is refused and exits nonzero; the live
+daemon keeps its socket.
+
 ## Roll back
 
 Deploy an earlier commit: `scripts/deploy <host> <commit>`. `~/.local/bin/roger.prev` holds

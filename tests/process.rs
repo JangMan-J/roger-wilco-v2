@@ -1681,6 +1681,193 @@ fn a_second_session_on_one_store_is_refused() {
     );
 }
 
+/// Run `roger daemon` on `sock` with its own log and Host id; wait up to 10 s
+/// for it to exit and return its status and stderr, or None if it kept
+/// running (it is then killed).
+fn second_daemon(rig: &Rig, sock: &Path, data: &str) -> Option<(std::process::ExitStatus, String)> {
+    let mut child = Command::new(BIN)
+        .args([
+            "daemon",
+            "--coordinator",
+            &format!("127.0.0.1:{}", rig.coord_port),
+            "--host-id",
+            "host-c",
+            "--socket",
+            sock.to_str().unwrap(),
+            "--data",
+            rig.p(data).to_str().unwrap(),
+        ])
+        .env("ROGER_TOKEN", TOKEN)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    let mut err = String::new();
+    child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut err)
+        .unwrap();
+    Some((status, err))
+}
+
+#[test]
+fn a_second_daemon_on_a_live_socket_is_refused_and_the_first_keeps_serving() {
+    let mut rig = Rig::new("socket-live");
+    rig.start_stack();
+    rig.start_recipient("recipient1.out", false);
+    let sock = rig.p("b.sock");
+    let Some((status, err)) = second_daemon(&rig, &sock, "c.log") else {
+        panic!("a second daemon on a live socket kept running");
+    };
+    assert!(!status.success(), "{status:?}");
+    assert!(err.contains(sock.to_str().unwrap()), "{err}");
+    assert!(err.contains("refusing to take over"), "{err}");
+    // A session that connects now is served by the first daemon, host-b.
+    start_session(&mut rig, "b.sock", IDLE, "idle.store", "idle.out");
+    let b = wait_board_lists(&rig, "a.sock", IDLE, true);
+    assert!(b.contains(&format!("address={IDLE} host=host-b")), "{b}");
+    rig.send("m-sock", "still served");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "DELIVERED mail=m-sock record=r-1",
+        Duration::from_secs(10),
+    );
+}
+
+#[test]
+fn a_daemon_replaces_a_stale_socket_left_by_a_dead_one() {
+    let mut rig = Rig::new("socket-stale");
+    rig.start_stack();
+    let sock = rig.p("stale.sock");
+    // Bound and dropped: the file stays, nothing listens behind it.
+    drop(std::os::unix::net::UnixListener::bind(&sock).unwrap());
+    assert!(sock.exists());
+    let args = [
+        "daemon",
+        "--coordinator",
+        &format!("127.0.0.1:{}", rig.coord_port),
+        "--host-id",
+        "host-c",
+        "--socket",
+        sock.to_str().unwrap(),
+        "--data",
+        rig.p("c.log").to_str().unwrap(),
+    ]
+    .map(String::from);
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    rig.spawn(&refs, "daemon-c.out");
+    wait_for_text(
+        &rig.p("daemon-c.out.err"),
+        "host daemon listening",
+        Duration::from_secs(10),
+    );
+    start_session(&mut rig, "stale.sock", IDLE, "idle.store", "idle.out");
+}
+
+#[test]
+fn a_daemon_refuses_to_remove_a_non_socket_at_its_path() {
+    let mut rig = Rig::new("socket-file");
+    rig.start_stack();
+    let path = rig.p("plain.sock");
+    fs::write(&path, "keep me").unwrap();
+    let Some((status, err)) = second_daemon(&rig, &path, "c.log") else {
+        panic!("a daemon on a regular file kept running");
+    };
+    assert!(!status.success(), "{status:?}");
+    assert!(err.contains("refusing to remove it"), "{err}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "keep me");
+}
+
+#[test]
+fn a_second_coordinator_on_a_bound_address_is_refused() {
+    let mut rig = Rig::new("coord-bind");
+    rig.start_stack();
+    let out = Command::new(BIN)
+        .args([
+            "coordinator",
+            "--bind",
+            &format!("127.0.0.1:{}", rig.coord_port),
+            "--data",
+            rig.p("coord-2.log").to_str().unwrap(),
+        ])
+        .env("ROGER_TOKEN", TOKEN)
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "{:?}", out.status);
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(err.contains("Address already in use"), "{err}");
+    rig.start_recipient("recipient1.out", false);
+    rig.send("m-coord", "still served");
+    wait_for_text(
+        &rig.p("recipient1.out"),
+        "DELIVERED mail=m-coord record=r-1",
+        Duration::from_secs(10),
+    );
+}
+
+/// The core falls back to no path: without its flags a daemon or coordinator
+/// refuses to start, so a test that forgets one can never reach a deployed
+/// host's socket or logs.
+#[test]
+fn the_core_has_no_default_socket_or_data_path() {
+    for (args, missing) in [
+        (
+            vec![
+                "daemon",
+                "--coordinator",
+                "127.0.0.1:1",
+                "--host-id",
+                "h",
+                "--data",
+                "/nonexistent/d.log",
+            ],
+            "missing --socket",
+        ),
+        (
+            vec![
+                "daemon",
+                "--coordinator",
+                "127.0.0.1:1",
+                "--host-id",
+                "h",
+                "--socket",
+                "/nonexistent/s.sock",
+            ],
+            "missing --data",
+        ),
+        (
+            vec!["coordinator", "--bind", "127.0.0.1:0"],
+            "missing --data",
+        ),
+        (vec!["board"], "missing --socket"),
+    ] {
+        let out = Command::new(BIN)
+            .args(&args)
+            .env("ROGER_TOKEN", TOKEN)
+            .output()
+            .unwrap();
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            !out.status.success() && err.contains(missing),
+            "{args:?}: {err}"
+        );
+    }
+}
+
 fn epoch_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

@@ -4,6 +4,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# A shell that loaded a live host's env must not hand its token, coordinator
+# or socket to anything started here: every phase sets its own, under $work.
+unset ROGER_TOKEN ROGER_COORDINATOR ROGER_HOST_ID ROGER_BIN ROGER_SOCKET ROGER_STORE ROGER_SESSION
 REMOTE_HOST="${ROGER_REMOTE_HOST:-agent-jail}"
 SENDER="11111111-1111-4111-8111-111111111111"
 RECIPIENT="22222222-2222-4222-8222-222222222222"

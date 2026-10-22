@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::TcpStream;
 use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -83,6 +83,9 @@ pub fn run(cfg: Config) -> io::Result<()> {
             apply(&mut state, &v);
         }
     }
+    // Bind before dialing upstream: a daemon refused its socket must not
+    // have joined the coordinator first.
+    let listener = bind_socket(&cfg.socket)?;
     let state = Arc::new(Mutex::new(state));
     let cfg = Arc::new(cfg);
 
@@ -92,8 +95,6 @@ pub fn run(cfg: Config) -> io::Result<()> {
         std::thread::spawn(move || upstream_loop(cfg, state));
     }
 
-    let _ = std::fs::remove_file(&cfg.socket);
-    let listener = UnixListener::bind(&cfg.socket)?;
     eprintln!("host daemon listening on {}", cfg.socket.display());
     for conn in listener.incoming() {
         let conn = conn?;
@@ -105,6 +106,49 @@ pub fn run(cfg: Config) -> io::Result<()> {
         });
     }
     Ok(())
+}
+
+/// Bind the host socket. A socket file left by a dead daemon is replaced;
+/// one a live process still answers on is refused, so a second daemon on
+/// the same path (a test, a copy of the project) cannot silently take over
+/// the live daemon's clients. Anything at the path that is not a socket is
+/// refused too, rather than deleted.
+fn bind_socket(path: &Path) -> io::Result<UnixListener> {
+    use std::os::unix::fs::FileTypeExt;
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+        Ok(m) if !m.file_type().is_socket() => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!(
+                    "expected {} absent or a socket, saw another kind of file; refusing to remove it",
+                    path.display()
+                ),
+            ))
+        }
+        Ok(_) => match UnixStream::connect(path) {
+            Ok(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::AddrInUse,
+                    format!(
+                        "expected no live listener on {}, saw one answering; refusing to take over its socket",
+                        path.display()
+                    ),
+                ))
+            }
+            Err(e) if e.kind() == io::ErrorKind::ConnectionRefused => {
+                std::fs::remove_file(path)?
+            }
+            Err(e) => {
+                return Err(io::Error::new(
+                    e.kind(),
+                    format!("cannot tell whether {} is live: {e}", path.display()),
+                ))
+            }
+        },
+    }
+    UnixListener::bind(path)
 }
 
 fn apply(state: &mut State, v: &Value) {

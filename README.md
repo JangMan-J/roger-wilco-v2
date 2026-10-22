@@ -98,7 +98,10 @@ Anything that fronts a harness sits on top of the core as an adapter-fronted shi
 `roger adapter` and talks to it in lines; the core never learns which harness is there.
 Every durable log (a Store, the daemon and coordinator logs) is held under an exclusive OS
 lock while open: a second process on the same Store fails at start, naming the file, and
-exits nonzero. When the adapter's stdin reaches EOF it unregisters its Address (see
+exits nonzero. A host daemon likewise refuses a `--socket` path that a live process still
+answers on, naming the path, and replaces only a stale socket file; a coordinator refuses a
+`--bind` address already in use. No core command has a default socket, data or log path:
+each comes from its flags. When the adapter's stdin reaches EOF it unregisters its Address (see
 Registration) before it exits; a shim ends its adapter by closing that stdin.
 
 Delivery to a model is best effort and separate from the core's guarantee. The adapter writes
