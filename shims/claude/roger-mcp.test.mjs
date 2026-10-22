@@ -13,10 +13,15 @@ import { createInterface } from "node:readline";
 const SHIM = new URL("./roger-mcp.mjs", import.meta.url).pathname;
 const MAIL = '{"type":"mail","mail":"m-1","from":"f","body":"hello","record":"r-1"}';
 
-// Every temp dir start() makes, removed after the file's tests whether or not
-// a test reached its own cleanup (a failed assertion or an exit test skips it).
+// Every shim and temp dir start() makes, killed and removed after the file's
+// tests whether or not a test reached its own cleanup (a failed assertion or an
+// exit test skips it); a live shim left behind would keep the run from ending.
+const children = [];
 const dirs = [];
-after(() => dirs.forEach((d) => rmSync(d, { recursive: true, force: true })));
+after(() => {
+	children.forEach((c) => c.kill());
+	dirs.forEach((d) => rmSync(d, { recursive: true, force: true }));
+});
 
 // Start the shim with a stand-in adapter (a shell script, or a missing path).
 function start(script, env = {}) {
@@ -32,6 +37,7 @@ function start(script, env = {}) {
 		env: { ...process.env, ROGER_BIN: bin, ROGER_SOCKET: "s", ROGER_STORE: "t", ...env },
 		stdio: ["pipe", "pipe", "pipe"],
 	});
+	children.push(child);
 	const lines = [];
 	const waiters = [];
 	createInterface({ input: child.stdout }).on("line", (l) => {
