@@ -33,13 +33,15 @@ Each Claude Code session starts its own copy of the shim, which runs
 same Address and Store. Its Store is
 `${XDG_STATE_HOME:-~/.local/state}/roger-shims/claude/<address>.store`.
 
-Without `ROGER_SESSION` or a UUID in `CLAUDE_CODE_SESSION_ID` (a `claude mcp list` health
-check starts the shim that way) the Address is a fresh random UUID that nothing can resume.
-On stdin EOF, SIGTERM or SIGINT the shim closes the adapter's stdin, so the adapter
-unregisters its Address and the Board and later broadcasts drop it at once, then waits for
-the adapter to exit (SIGKILL after 3 s, gives up after 5 s). For a random Address it then
-removes that default Store; a Store under `ROGER_SESSION`, Claude Code's session id, or an
-explicit `ROGER_STORE` stays.
+Without `ROGER_SESSION` or a UUID in `CLAUDE_CODE_SESSION_ID` the Address is a fresh random
+UUID that nothing can resume. On stdin EOF, SIGTERM or SIGINT the shim closes the adapter's
+stdin, so the adapter unregisters its Address and the Board and later broadcasts drop it at
+once, then waits for the adapter to exit (SIGKILL after 3 s, gives up after 5 s). It then
+removes the default Store when it can hold nothing worth keeping: the Address was random, or
+the Store is empty (no Mail was ever stored, and a resume recreates the same empty file). A
+`claude mcp list` health check runs the shim under its own fresh session id (observed:
+`CLAUDE_CODE_SESSION_ID` set, then SIGINT), stores nothing, and so leaves neither a
+registration nor a Store. A Store holding Mail, or an explicit `ROGER_STORE`, stays.
 
 Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_SOCKET`,
 `ROGER_BIN`, `ROGER_STORE`, `ROGER_DECLARE`, `ROGER_PRESENCE_WINDOW_MS`. To set one for

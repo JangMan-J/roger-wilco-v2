@@ -297,6 +297,8 @@ test("no ROGER_SOCKET and no XDG_RUNTIME_DIR ends the shim nonzero and says so",
 // reads stdin to EOF and leaves an `eof` marker beside itself before exiting.
 const STORE_THEN_EOF =
 	'while [ $# -gt 0 ]; do [ "$1" = --store ] && store="$2"; shift; done; : >"$store"; cat >/dev/null; : >"$(dirname "$0")/eof"';
+// The same, but its Store holds one record, as after a stored delivery.
+const STORE_ONE_RECORD = STORE_THEN_EOF.replace(': >"$store"', 'echo "{}" >"$store"');
 const storeOf = async (s, id) => {
 	s.rpc(id, "ping");
 	await within(3000, s.reply(id));
@@ -318,12 +320,20 @@ test("a random Address leaves no Store once stdin closes and the adapter has exi
 	assert.equal(existsSync(store), false, `${store} must be removed`);
 });
 
-test("a ROGER_SESSION or harness-session Address keeps its Store at shutdown", async () => {
+test("an empty harness-session Store (a health check's) is removed at shutdown", async () => {
+	const s = start(STORE_THEN_EOF, { XDG_RUNTIME_DIR: "/run/x", CLAUDE_CODE_SESSION_ID: SID }, { home: true });
+	const store = await storeOf(s, 35);
+	s.child.stdin.end();
+	assert.equal(await within(5000, s.exited), 0);
+	assert.equal(existsSync(store), false, `${store} must be removed`);
+});
+
+test("a ROGER_SESSION or harness-session Address keeps a Store that holds Mail", async () => {
 	for (const [id, env] of [
 		[31, { ROGER_SESSION: "keep-id" }],
 		[32, { CLAUDE_CODE_SESSION_ID: SID }],
 	]) {
-		const s = start(STORE_THEN_EOF, { XDG_RUNTIME_DIR: "/run/x", ...env }, { home: true });
+		const s = start(STORE_ONE_RECORD, { XDG_RUNTIME_DIR: "/run/x", ...env }, { home: true });
 		const store = await storeOf(s, id);
 		assert.equal(store.endsWith(`${env.ROGER_SESSION ?? SID}.store`), true, store);
 		s.child.stdin.end();

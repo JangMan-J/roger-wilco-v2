@@ -17,9 +17,12 @@
 //                  (CLAUDE_CODE_SESSION_ID, which Claude Code sets for its MCP
 //                  stdio children) when it is a UUID, else a fresh randomUUID.
 //                  The session id survives `--resume`, so a resumed session
-//                  keeps its Address and its Store. A fresh randomUUID (as in a
-//                  `claude mcp list` health check) can never be resumed, so its
-//                  default Store is removed at shutdown.
+//                  keeps its Address and its Store. At shutdown a default Store
+//                  is removed when it can hold nothing worth keeping: its
+//                  Address was a fresh randomUUID (never resumable), or it is
+//                  empty (no Mail was ever stored; a resume recreates the same
+//                  empty file). A `claude mcp list` health check gets its own
+//                  fresh session id and stores nothing, so it leaves no Store.
 //   ROGER_SOCKET   default $XDG_RUNTIME_DIR/roger/daemon.sock
 //   ROGER_BIN      default ~/.local/bin/roger when it exists, else `roger`
 //   ROGER_STORE    default ${XDG_STATE_HOME:-~/.local/state}/roger-shims/claude/<address>.store:
@@ -33,7 +36,7 @@
 // exit (SIGKILL after 3 s, give up after 5 s), and exits.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -53,9 +56,10 @@ const installed = join(homedir(), ".local", "bin", "roger");
 const bin = env("ROGER_BIN") ?? (existsSync(installed) ? installed : "roger");
 const state = env("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
 const store = env("ROGER_STORE") ?? join(state, "roger-shims", "claude", `${session}.store`);
-// Nobody can reopen a random Address, so its default Store is dead weight once
-// the adapter is gone. An explicit ROGER_STORE is the caller's file and stays.
-const throwaway = random && !env("ROGER_STORE");
+// Nobody can reopen a random Address, and an empty Store holds nothing, so
+// either default Store is dead weight once the adapter is gone. An explicit
+// ROGER_STORE is the caller's file and stays.
+const throwaway = () => !env("ROGER_STORE") && (random || !existsSync(store) || statSync(store).size === 0);
 mkdirSync(dirname(store), { recursive: true });
 function windowMs(env) {
 	const n = env === undefined || env.trim() === "" ? NaN : Number(env);
@@ -278,7 +282,7 @@ async function shutdown(code) {
 	const kill = setTimeout(() => adapter.kill("SIGKILL"), 3000);
 	const exited = await Promise.race([ended.then(() => true), new Promise((r) => setTimeout(r, 5000, false))]);
 	clearTimeout(kill);
-	if (exited && throwaway) rmSync(store, { force: true });
+	if (exited && throwaway()) rmSync(store, { force: true });
 	if (!exited) console.error(`roger shim: adapter did not exit; left ${store}`);
 	process.exit(code);
 }
