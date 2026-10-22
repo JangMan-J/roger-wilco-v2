@@ -30,6 +30,17 @@ itself at Register, stored by the core and returned verbatim; `board` prints it 
 `DECLARED address= declared=` line after that session's `SESSION` line. Shims live outside `src/`: `shims/pi/roger.ts` (Pi extension) and
 `shims/claude/roger-mcp.mjs` (Claude Code MCP server).
 
+## Deploy
+
+`scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on
+`<host>`: the release binary at `~/.local/bin/roger` (the replaced one kept as
+`roger.prev`), `~/.config/roger/env`, and the systemd user units in `deploy/`
+(`roger-daemon.service` on every host, `roger-coordinator.service` on the coordinator host).
+The host daemon serves `$XDG_RUNTIME_DIR/roger/daemon.sock`. That socket and the binary are
+the whole surface for anything on top: a plain client (`roger send`, `roger board`), the
+Tracer, or an adapter-fronted shim, each installed separately. Units start at boot only
+with lingering enabled (`loginctl enable-linger`).
+
 ## Claims
 
 A claim's deadline is `now + ttl_ms` on the coordinator's wall clock, in milliseconds
