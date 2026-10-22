@@ -3,7 +3,7 @@
 // protocol handling; it is not harness evidence (scripts/acceptance
 // independence runs the real Claude Code). Run: node --test shims/claude
 import { spawn } from "node:child_process";
-import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { after, test } from "node:test";
@@ -291,4 +291,57 @@ test("no ROGER_SOCKET and no XDG_RUNTIME_DIR ends the shim nonzero and says so",
 	const s = start(ARGV, { XDG_RUNTIME_DIR: undefined }, { home: true });
 	assert.equal(await within(5000, s.exited), 1);
 	assert.match(s.stderr(), /XDG_RUNTIME_DIR/);
+});
+
+// A stand-in that creates its --store file, as the real adapter does, then
+// reads stdin to EOF and leaves an `eof` marker beside itself before exiting.
+const STORE_THEN_EOF =
+	'while [ $# -gt 0 ]; do [ "$1" = --store ] && store="$2"; shift; done; : >"$store"; cat >/dev/null; : >"$(dirname "$0")/eof"';
+const storeOf = async (s, id) => {
+	s.rpc(id, "ping");
+	await within(3000, s.reply(id));
+	const store = join(s.dir, ".local", "state", "roger-shims", "claude");
+	for (let i = 0; i < 100; i++) {
+		const f = readdirSync(store).find((n) => n.endsWith(".store"));
+		if (f) return join(store, f);
+		await new Promise((r) => setTimeout(r, 20));
+	}
+	throw new Error(`no Store created; stderr: ${s.stderr()}`);
+};
+
+test("a random Address leaves no Store once stdin closes and the adapter has exited", async () => {
+	const s = start(STORE_THEN_EOF, { XDG_RUNTIME_DIR: "/run/x" }, { home: true });
+	const store = await storeOf(s, 30);
+	s.child.stdin.end();
+	assert.equal(await within(5000, s.exited), 0);
+	assert.ok(existsSync(join(s.dir, ".local", "bin", "eof")), "adapter saw stdin EOF");
+	assert.equal(existsSync(store), false, `${store} must be removed`);
+});
+
+test("a ROGER_SESSION or harness-session Address keeps its Store at shutdown", async () => {
+	for (const [id, env] of [
+		[31, { ROGER_SESSION: "keep-id" }],
+		[32, { CLAUDE_CODE_SESSION_ID: SID }],
+	]) {
+		const s = start(STORE_THEN_EOF, { XDG_RUNTIME_DIR: "/run/x", ...env }, { home: true });
+		const store = await storeOf(s, id);
+		assert.equal(store.endsWith(`${env.ROGER_SESSION ?? SID}.store`), true, store);
+		s.child.stdin.end();
+		assert.equal(await within(5000, s.exited), 0);
+		assert.ok(existsSync(store), `${store} must stay`);
+	}
+});
+
+test("SIGTERM and SIGINT close the adapter's stdin and wait for its exit", async () => {
+	for (const [id, sig, code] of [
+		[33, "SIGTERM", 143],
+		[34, "SIGINT", 130],
+	]) {
+		const s = start("cat >/dev/null; sleep 0.2; : >\"$(dirname \"$0\")/eof\"");
+		s.rpc(id, "ping");
+		await within(3000, s.reply(id));
+		s.child.kill(sig);
+		assert.equal(await within(5000, s.exited), code);
+		assert.ok(existsSync(join(s.dir, "eof")), `${sig}: adapter saw stdin EOF before the shim exited`);
+	}
 });

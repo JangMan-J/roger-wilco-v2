@@ -1,8 +1,10 @@
 # Coding standards
 
-The gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
-`scripts/check-harness-free`, and `scripts/check-no-poll`. Nothing lands on main
-until it exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints]`; the
+The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
+`scripts/check-harness-free`, and `scripts/check-no-poll`. It names no harness.
+`scripts/check-all` runs it, then every `shims/<name>/check` it finds; a shim
+brings its own check and the core gate never changes for it. Nothing lands on
+main until `scripts/check-all` exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints]`; the
 gate turns those warnings into errors.
 
 ## Review rules
@@ -21,9 +23,11 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
 3. **Opaque integers stay opaque.** Nothing in `src/` compares, branches on, ranks,
    looks up by, or names the integers in a Reference or on a session. They pass
    through byte-identical. `scripts/acceptance references` is the check.
-4. **No harness in the core.** `src/` names no harness, reads no harness store, and
-   `[dependencies]` stays empty. Only `shims/` may know a harness.
-   `scripts/check-harness-free` is the check.
+4. **No harness in the core.** The core names no harness, reads no harness store, and
+   `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
+   file outside `shims/` and `VECTORS/`: source, tests, scripts, deploy units, and
+   docs; `scripts/acceptance` alone is exempt, since proofs 2 and 5 run real
+   harnesses. `scripts/check-harness-free` is the check.
 5. **No workflow.** The core stores and routes; it never decides what work exists or
    who takes it.
 

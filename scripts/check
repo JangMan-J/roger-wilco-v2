@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# The single gate: every change on main passes this before it lands.
+# The core gate: every change on main passes this before it lands. It names no
+# harness; scripts/check-all adds each shim's own check on top.
 # Usage: scripts/check
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -12,6 +13,4 @@ step cargo clippy --offline --all-targets -- -D warnings
 step cargo test --offline
 step scripts/check-harness-free
 step scripts/check-no-poll
-step node --test shims/pi/test/roger-target.test.ts shims/pi/test/roger-env.test.ts
-step node --test shims/claude
 echo "PASS check"

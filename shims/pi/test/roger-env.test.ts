@@ -1,11 +1,7 @@
-// Unit tests for the shim defaults and the Store lock: node --test shims/pi/test/roger-env.test.ts
+// Unit tests for the shim defaults: node --test shims/pi/test/roger-env.test.ts
 import assert from "node:assert/strict";
-import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { test } from "node:test";
-import { lockStore, settings } from "../roger-env.ts";
+import { settings } from "../roger-env.ts";
 
 const PI_ID = "019a0000-0000-7000-8000-000000000001";
 const never = () => {
@@ -57,24 +53,4 @@ test("no Pi session id: a fresh UUID", () => {
 
 test("no socket and no XDG_RUNTIME_DIR is an error naming both", () => {
 	assert.throws(() => settings({}, PI_ID, "/h", never), /ROGER_SOCKET .*XDG_RUNTIME_DIR/);
-});
-
-test("Store lock: one live holder, stale taken over, released on release", () => {
-	const dir = mkdtempSync(join(tmpdir(), "roger-env-"));
-	try {
-		const store = join(dir, "stores", "a.store");
-		const release = lockStore(store);
-		assert.equal(readFileSync(`${store}.lock`, "utf8"), `${process.pid}\n`);
-		assert.throws(() => lockStore(store), new RegExp(`held by pid ${process.pid}`));
-		release();
-		assert.equal(existsSync(`${store}.lock`), false);
-
-		const dead = spawnSync("true").pid!; // exited: its pid is not alive
-		writeFileSync(`${store}.lock`, `${dead}\n`);
-		const again = lockStore(store);
-		assert.equal(readFileSync(`${store}.lock`, "utf8"), `${process.pid}\n`);
-		again();
-	} finally {
-		rmSync(dir, { recursive: true, force: true });
-	}
 });

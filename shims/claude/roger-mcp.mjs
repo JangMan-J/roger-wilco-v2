@@ -17,7 +17,9 @@
 //                  (CLAUDE_CODE_SESSION_ID, which Claude Code sets for its MCP
 //                  stdio children) when it is a UUID, else a fresh randomUUID.
 //                  The session id survives `--resume`, so a resumed session
-//                  keeps its Address and its Store.
+//                  keeps its Address and its Store. A fresh randomUUID (as in a
+//                  `claude mcp list` health check) can never be resumed, so its
+//                  default Store is removed at shutdown.
 //   ROGER_SOCKET   default $XDG_RUNTIME_DIR/roger/daemon.sock
 //   ROGER_BIN      default ~/.local/bin/roger when it exists, else `roger`
 //   ROGER_STORE    default ${XDG_STATE_HOME:-~/.local/state}/roger-shims/claude/<address>.store:
@@ -25,9 +27,13 @@
 //   ROGER_DECLARE  opaque text the session states about itself at Register,
 //                  passed verbatim as `--declare`; unset declares nothing. This
 //                  shim cannot start a turn, so it never declares a wake latency.
+//
+// Shutdown: on stdin EOF, SIGTERM or SIGINT the shim closes the adapter's
+// stdin (the adapter then unregisters its Address and exits), waits for that
+// exit (SIGKILL after 3 s, give up after 5 s), and exits.
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { createInterface } from "node:readline";
@@ -35,7 +41,8 @@ import { createInterface } from "node:readline";
 const env = (k) => process.env[k] || undefined; // empty counts as unset
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const harnessId = env("CLAUDE_CODE_SESSION_ID");
-const session = env("ROGER_SESSION") ?? (harnessId && UUID.test(harnessId) ? harnessId : randomUUID());
+const random = !env("ROGER_SESSION") && !(harnessId && UUID.test(harnessId));
+const session = env("ROGER_SESSION") ?? (random ? randomUUID() : harnessId);
 const runtime = env("XDG_RUNTIME_DIR");
 const socket = env("ROGER_SOCKET") ?? (runtime && join(runtime, "roger", "daemon.sock"));
 if (!socket) {
@@ -46,6 +53,9 @@ const installed = join(homedir(), ".local", "bin", "roger");
 const bin = env("ROGER_BIN") ?? (existsSync(installed) ? installed : "roger");
 const state = env("XDG_STATE_HOME") ?? join(homedir(), ".local", "state");
 const store = env("ROGER_STORE") ?? join(state, "roger-shims", "claude", `${session}.store`);
+// Nobody can reopen a random Address, so its default Store is dead weight once
+// the adapter is gone. An explicit ROGER_STORE is the caller's file and stays.
+const throwaway = random && !env("ROGER_STORE");
 mkdirSync(dirname(store), { recursive: true });
 function windowMs(env) {
 	const n = env === undefined || env.trim() === "" ? NaN : Number(env);
@@ -55,12 +65,15 @@ const WINDOW_MS = windowMs(process.env.ROGER_PRESENCE_WINDOW_MS);
 const args = ["adapter", "--socket", socket, "--store", store, "--id", session];
 if (env("ROGER_DECLARE")) args.push("--declare", env("ROGER_DECLARE"));
 const adapter = spawn(bin, args, { stdio: ["pipe", "pipe", "inherit"] });
-let closing = false; // our own stdin ended: the adapter's exit is expected
+let closing = false; // shutting down: the adapter's exit is expected
 let dead = null; // why the adapter is gone, once it is
+let adapterGone;
+const ended = new Promise((r) => (adapterGone = r)); // the adapter exited or never started
 const gone = (e) => {
+	adapterGone();
 	if (dead) return;
 	dead = e;
-	if (closing) process.exit(0);
+	if (closing) return; // shutdown() exits once the adapter is gone
 	console.error(`roger shim: ${e.message}`);
 	for (const p of pending.splice(0)) p.fail(e);
 	wakeAll();
@@ -256,7 +269,19 @@ createInterface({ input: process.stdin }).on("line", async (line) => {
 		reply(m.id, undefined, { code: -32603, message: String(e.message) });
 	}
 });
-process.stdin.on("end", () => {
+// Close the adapter's stdin so it unregisters and exits, wait for it
+// (bounded), drop a throwaway Store, then exit.
+async function shutdown(code) {
+	if (closing) return;
 	closing = true;
 	adapter.stdin.end();
-});
+	const kill = setTimeout(() => adapter.kill("SIGKILL"), 3000);
+	const exited = await Promise.race([ended.then(() => true), new Promise((r) => setTimeout(r, 5000, false))]);
+	clearTimeout(kill);
+	if (exited && throwaway) rmSync(store, { force: true });
+	if (!exited) console.error(`roger shim: adapter did not exit; left ${store}`);
+	process.exit(code);
+}
+process.stdin.on("end", () => shutdown(0));
+process.on("SIGTERM", () => shutdown(143));
+process.on("SIGINT", () => shutdown(130));

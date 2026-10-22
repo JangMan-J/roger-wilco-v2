@@ -8,7 +8,7 @@
 #
 # Idempotent: rerunning replaces the copy and the registration. Touches nothing
 # outside its own directory and the `roger` entry in Claude Code's user config.
-# See INSTALL.md.
+# See README.md.
 set -euo pipefail
 
 src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/roger-mcp.mjs"
