@@ -1,0 +1,13 @@
+[Unit]
+Description=Roger-Wilco coordinator (one per fleet)
+# Binds the tailnet address; keep retrying until tailscale has it.
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=%h/.config/roger/env
+ExecStart=%h/.local/bin/roger coordinator --bind 100.107.29.105:7477 --data %h/.local/share/roger/coordinator.log --token ${ROGER_TOKEN}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

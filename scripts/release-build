@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# The release build of one commit, from a clean export of that commit, with
+# the source path remapped so the bytes do not depend on where it was built.
+# scripts/deploy installs it; scripts/check-deployed rebuilds it and compares.
+# Usage: scripts/release-build <commit> <out-dir>   (writes <out-dir>/roger and <out-dir>/shims/)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ $# -eq 2 ]] || { echo "usage: $0 <commit> <out-dir>" >&2; exit 2; }
+commit="$(git -C "$ROOT" rev-parse --verify "$1^{commit}")"
+out="$2"
+work="$(mktemp -d "${TMPDIR:-/tmp}/roger-release.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+mkdir -p "$work/src" "$out"
+git -C "$ROOT" archive "$commit" | tar -x -C "$work/src"
+(
+  cd "$work/src"
+  CARGO_TARGET_DIR="$work/target" RUSTFLAGS="--remap-path-prefix=$work/src=/roger" \
+    cargo build --release --offline -q
+)
+install -m 0755 "$work/target/release/roger" "$out/roger"
+rm -rf "$out/shims"
+cp -a "$work/src/shims" "$out/shims"
+echo "$commit"

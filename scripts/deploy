@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Install the release build of one commit on one host and (re)start its user
+# units. Idempotent: running it twice leaves the same files and running units.
+#   - binary   ~/.local/bin/roger                (same bytes on every host)
+#   - shims    ~/.local/share/roger/shims/{pi,claude}/
+#   - env      ~/.config/roger/env (0600): ROGER_TOKEN, ROGER_COORDINATOR, ROGER_HOST_ID
+#   - units    ~/.config/systemd/user/roger-daemon.service (every host),
+#              roger-coordinator.service ($COORD_HOST only)
+#   - record   ~/.local/share/roger/deployed: commit and sha256 of the binary
+# Run it on $COORD_HOST: the token is generated there once and copied out.
+# Usage: scripts/deploy <host> [commit]    (commit defaults to HEAD)
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+COORD_HOST=decent-spider
+COORD_ADDR=100.107.29.105:7477
+SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
+ENV_FILE="$HOME/.config/roger/env"
+
+die() { echo "FAIL deploy: $*" >&2; exit 1; }
+[[ $# -ge 1 && $# -le 2 ]] || { echo "usage: $0 <host> [commit]" >&2; exit 2; }
+host="$1"
+rev="${2:-HEAD}"
+[[ "$(hostname)" == "$COORD_HOST" ]] || die "run on $COORD_HOST (it holds the token); this is $(hostname)"
+is_local=0
+[[ "$host" == "$(hostname)" ]] && is_local=1
+
+# Run a bash script (read from stdin) on the target host.
+on() {
+  if ((is_local)); then bash -s; else timeout 120 ssh "${SSH_OPTS[@]}" "$host" bash -s; fi
+}
+# Copy with rsync to a path under the target's home.
+put() {
+  local src="$1" dest="$2"; shift 2
+  if ((is_local)); then
+    rsync -a "$@" "$src" "$HOME/$dest"
+  else
+    timeout 120 rsync -a -e "ssh ${SSH_OPTS[*]}" "$@" "$src" "$host:$dest"
+  fi
+}
+
+# The token is generated once, on the coordinator host, and never rotated here.
+if [[ ! -f "$ENV_FILE" ]]; then
+  mkdir -p "$(dirname "$ENV_FILE")"
+  (umask 077; printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' \
+    "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" "$COORD_ADDR" "$COORD_HOST" >"$ENV_FILE")
+  echo "generated $ENV_FILE"
+fi
+token="$(sed -n 's/^ROGER_TOKEN=//p' "$ENV_FILE")"
+[[ -n "$token" ]] || die "$ENV_FILE has no ROGER_TOKEN"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/roger-deploy.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+commit="$("$ROOT/scripts/release-build" "$rev" "$work/rel")"
+sum="$(sha256sum "$work/rel/roger" | cut -d' ' -f1)"
+printf 'commit=%s\nsha256=%s\n' "$commit" "$sum" >"$work/deployed"
+echo "deploy $host: commit $commit sha256 $sum"
+
+units=(roger-daemon.service)
+[[ "$host" == "$COORD_HOST" ]] && units=(roger-coordinator.service roger-daemon.service)
+
+on <<'EOF' || die "prepare directories on $host"
+set -e
+mkdir -p ~/.local/bin ~/.local/share/roger/shims ~/.config/roger ~/.config/systemd/user
+chmod 700 ~/.config/roger
+EOF
+# Same token everywhere; only the host id differs. Sent on stdin, not argv.
+{
+  echo 'set -e; umask 077'
+  echo 'cat > ~/.config/roger/env.new <<"ENV"'
+  printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' "$token" "$COORD_ADDR" "$host"
+  echo 'ENV'
+  echo 'mv -f ~/.config/roger/env.new ~/.config/roger/env'
+} | on || die "write env on $host"
+put "$work/rel/roger" .local/bin/roger.new || die "copy binary to $host"
+# node_modules a shim installed in place survives --delete.
+put "$work/rel/shims/" .local/share/roger/shims/ --delete --exclude node_modules || die "copy shims to $host"
+put "$work/deployed" .local/share/roger/deployed || die "copy record to $host"
+for u in "${units[@]}"; do
+  put "$ROOT/deploy/$u" ".config/systemd/user/$u" || die "copy $u to $host"
+done
+
+on <<EOF || die "start units on $host"
+set -e
+mv -f ~/.local/bin/roger.new ~/.local/bin/roger
+systemctl --user daemon-reload
+systemctl --user enable ${units[*]} >/dev/null 2>&1
+for u in ${units[*]}; do systemctl --user restart "\$u"; done
+for i in \$(seq 50); do
+  ok=1
+  for u in ${units[*]}; do systemctl --user is-active --quiet "\$u" || ok=0; done
+  test -S "\$XDG_RUNTIME_DIR/roger/daemon.sock" || ok=0
+  [ \$ok = 1 ] && break
+  sleep 0.2
+done
+for u in ${units[*]}; do echo "$host \$u: \$(systemctl --user is-active "\$u")"; done
+test -S "\$XDG_RUNTIME_DIR/roger/daemon.sock" && echo "$host socket: \$XDG_RUNTIME_DIR/roger/daemon.sock"
+[ \$ok = 1 ]
+EOF
+echo "PASS deploy $host $commit"

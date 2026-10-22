@@ -1,0 +1,17 @@
+[Unit]
+Description=Roger-Wilco host daemon (one per host)
+# Ordering only: the coordinator unit exists on one host, and the daemon
+# reconnects to it on its own.
+After=roger-coordinator.service
+StartLimitIntervalSec=0
+
+[Service]
+EnvironmentFile=%h/.config/roger/env
+RuntimeDirectory=roger
+RuntimeDirectoryMode=0700
+ExecStart=%h/.local/bin/roger daemon --coordinator ${ROGER_COORDINATOR} --token ${ROGER_TOKEN} --host-id ${ROGER_HOST_ID} --socket %t/roger/daemon.sock --data %h/.local/share/roger/daemon.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target
