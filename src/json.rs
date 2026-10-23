@@ -197,6 +197,9 @@ impl Parser<'_> {
                                 }
                                 self.i += 1;
                                 let lo = self.hex4()?;
+                                if !(0xDC00..0xE000).contains(&lo) {
+                                    return Err(format!("expected low surrogate, got {lo:04x}"));
+                                }
                                 let cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00);
                                 out.push(char::from_u32(cp).ok_or("bad codepoint")?);
                             } else if (0xDC00..0xE000).contains(&hi) {
@@ -304,6 +307,49 @@ mod tests {
         assert_eq!(v.get("type").unwrap().as_str(), Some("ack"));
         assert_eq!(v.get("req").unwrap().as_i64(), Some(-3));
         assert_eq!(v.get("body").unwrap().as_str(), Some("café"));
+    }
+
+    #[test]
+    fn decodes_surrogate_pairs() {
+        for (text, expected) in [
+            (r#""\ud800\udc00""#, "\u{10000}"),
+            (r#""\uD83D\uDE00""#, "😀"),
+            (r#""\udbff\udfff""#, "\u{10ffff}"),
+            (r#""\u00e9\u2603""#, "é☃"),
+        ] {
+            assert_eq!(parse(text).unwrap(), s(expected));
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_surrogate_escapes() {
+        for text in [
+            r#""\ud800\u0041""#,
+            r#""\ud800\ud800""#,
+            r#""\ud800\udbff""#,
+            r#""\ud800\ue000""#,
+            r#""\ud800\uffff""#,
+            r#""\ud800""#,
+            r#""\ud800x""#,
+            r#""\ud800\n""#,
+            r#""\ud800\uZZZZ""#,
+            r#""\ud800\udc0""#,
+            r#""\ud800\u"#,
+            r#""\ud800\"#,
+            r#""\ud800"#,
+            r#""\udc00""#,
+            r#""\udfff""#,
+            r#""\udc00\ud800""#,
+            r#""\udbff\u0000""#,
+            r#"{"type":"board","x":"\ud800\u0041"}"#,
+            r#"{"body":"\ud83d\u00e9"}"#,
+        ] {
+            let got = std::panic::catch_unwind(|| parse(text));
+            assert!(
+                matches!(got, Ok(Err(_))),
+                "expected error, not a panic, for {text}: {got:?}"
+            );
+        }
     }
 
     #[test]
