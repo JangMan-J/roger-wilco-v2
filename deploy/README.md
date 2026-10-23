@@ -1,16 +1,34 @@
 # Deploy
 
-How the core is installed and run on the owner's hosts. What the core guarantees is in the
+How the core is installed and run on your hosts: one coordinator host, and a host daemon on
+every host including that one. What the core guarantees is in the
 [top-level README](../README.md); a shim installs on top of a deployed core per its own
 `shims/<name>/README.md`.
 
+## Before you start
+
+- Pick the coordinator host and run every deploy from a checkout there. It holds the fleet
+  token and builds the binary.
+- Every other host is reached as an SSH destination with key-based login (deploy uses
+  `BatchMode=yes`) and gets the binary built on the coordinator host, so it must run the
+  same OS and CPU architecture.
+- Every host runs systemd with user units (`systemctl --user`).
+- The coordinator link is plain TCP: the token and every Mail body cross it unencrypted.
+  Bind the coordinator to a private network all hosts can reach, such as a VPN, never to a
+  public interface.
+
 ## Install
 
-`scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on
-`<host>` and (re)starts its units. `commit` defaults to `HEAD`; deploy builds it from
-`git archive` with `cargo build --release --offline` and refuses a binary that carries the
-`test-hooks` feature. It is idempotent: run it again to update. `<host>` is an ssh
-destination, or this host's own name for a local install.
+`scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on `<host>`
+and (re)starts its units. `commit` defaults to `HEAD`; deploy builds it from `git archive`
+with `cargo build --release --offline` and refuses a binary that carries the `test-hooks`
+feature. It is idempotent: run it again to update. `<host>` is an SSH destination, or this
+host's own `hostname` for a local install; only a local install adds the coordinator unit.
+
+```sh
+ROGER_BIND=<private-address>:7477 scripts/deploy "$(hostname)"   # first run: the coordinator host
+scripts/deploy <user>@<host-b>                                    # each other host
+```
 
 On `<host>` it writes:
 
@@ -28,15 +46,19 @@ uses.
 
 ## Host config
 
-`~/.config/roger/env` on the coordinator host is the source for every host's env:
+`~/.config/roger/env` on the coordinator host is the source for every host's env. Deploy
+creates it on its first run and copies the token and coordinator address from it to each
+host:
 
-- `ROGER_TOKEN`, the fleet token, is generated once, on the first deploy from this host, and
-  never rotated by deploy. The units pass it to the core through `EnvironmentFile=`, never
-  argv (README `## Build and test`).
+- `ROGER_TOKEN`, the fleet token, is generated once, on that first run, and never rotated by
+  deploy. The units pass it to the core through `EnvironmentFile=`, never argv.
 - `ROGER_COORDINATOR` is the address the coordinator listens on and every host daemon dials.
-  On the first run it is `ROGER_BIND` if set, else this host's tailnet IPv4, port 7477.
-- `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the ssh name used to reach it. An ssh
-  alias names the route; the hostname names the machine. Deploy refuses a hostname that is not `[A-Za-z0-9._-]+`.
+  On the first run it is `ROGER_BIND` if set. Otherwise deploy uses the first address from
+  `tailscale ip -4` with port 7477, and stops with `set ROGER_BIND` when that gives none. To
+  change it later, edit this file and deploy every host again.
+- `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the SSH name used to reach it: an SSH
+  alias names the route, the hostname names the machine. Deploy refuses a hostname that is
+  not `[A-Za-z0-9._-]+`.
 
 ## Services
 
@@ -76,13 +98,13 @@ A shim keeps its own state (its Stores); back that up per its README.
 
 ## Procedure
 
-1. Run `scripts/check-all` on the commit to ship and land it on main.
+1. Run `scripts/check-all` on the commit to ship.
 2. Read the Board on each host (`roger board --socket "$XDG_RUNTIME_DIR/roger/daemon.sock"`)
    to see who is registered and what is claimed before the restart. Accepted Mail survives
    the coordinator and daemon restarts; sessions re-register.
 3. Back up every host (above).
-4. `scripts/deploy <coordinator-host> main`, then `scripts/deploy <host> main` for each other
-   host. Each must end in `PASS`.
+4. `scripts/deploy <coordinator-host> <commit>`, then `scripts/deploy <host> <commit>` for
+   each other host. Each must end in `PASS`.
 5. Check live: start a Tracer on two hosts, read the Board from both, send each way, and read
    each Receipt.
 
@@ -94,7 +116,8 @@ A shim keeps its own state (its Stores); back that up per its README.
    roger receipt --socket "$sock" --mail live-1
    ```
 
-   Stop the Tracers afterwards; they leave the Board after `--unregister-after-ms`.
+   Stop the Tracers afterwards; they leave the Board after `--unregister-after-ms`
+   (default 5 minutes).
 6. `ps` shows no token for the coordinator or a daemon, and
    `grep -c -- --hold-before-ack ~/.local/bin/roger` prints 0.
 
@@ -107,7 +130,8 @@ coordinator and daemons with a token of its own, a loopback `--bind`, and a `--s
 `--data` under the copy's own temp directory, as `tests/process.rs` and `scripts/acceptance`
 do; `scripts/acceptance` unsets every inherited `ROGER_*` variable that names a token,
 coordinator, host, socket, Store, session or binary. `scripts/deploy` is the one script that
-reads the live env; run it only for a commit on main (Procedure), never to try out a copy.
+reads the live env; run it only for a commit you mean to ship (Procedure), never to try out
+a copy.
 
 A daemon started on the live socket path by mistake is refused and exits nonzero; the live
 daemon keeps its socket.

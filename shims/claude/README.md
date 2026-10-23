@@ -1,8 +1,9 @@
 # Claude Code shim
 
-An MCP stdio server (`roger-mcp.mjs`, no dependencies) that runs `roger adapter` for each
-Claude Code session and exposes `roger_send`, `roger_inbox`, `roger_board`, `roger_label`,
-`roger_claim` and `roger_release`.
+Connects each Claude Code session to Roger-Wilco, so it can send and receive Mail, read the
+Board and hold claims. The shim is an MCP stdio server (`roger-mcp.mjs`, no dependencies)
+that runs `roger adapter` for its session and exposes the tools `roger_send`, `roger_inbox`,
+`roger_board`, `roger_label`, `roger_claim` and `roger_release`.
 
 ## Install
 
@@ -63,6 +64,6 @@ shims/claude/check                # protocol and lifecycle against a scripted ad
 scripts/acceptance independence   # proof 2: this shim is one of the two harnesses
 ```
 
-`scripts/acceptance independence` needs `claude` (logged in) and `node`, and makes one real
-Claude Code model call (haiku). Claude's tool results are read from its own stream-json
-output.
+`scripts/acceptance independence` runs on loopback and needs `claude` (logged in), `pi`,
+`node` and `jq`. It makes one real Claude Code model call (haiku), billed to the logged-in
+account. Claude's tool results are read from its own stream-json output.

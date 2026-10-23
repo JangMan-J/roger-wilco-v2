@@ -3,6 +3,8 @@
 # adding or removing a shim needs no edit here.
 # Usage: scripts/check-all
 set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate and all shim checks)"; exit 0; fi
+[[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 

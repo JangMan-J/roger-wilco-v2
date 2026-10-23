@@ -1,11 +1,13 @@
 # Coding standards
 
 The core gate is `scripts/check`: fmt, clippy with warnings denied, the test suite,
-`scripts/check-harness-free`, and `scripts/check-no-poll`. It names no harness.
-`scripts/check-all` runs it, then every `shims/<name>/check` it finds; a shim
-brings its own check and the core gate never changes for it. Nothing lands on
-main until `scripts/check-all` exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints]`; the
-gate turns those warnings into errors.
+`scripts/check-harness-free`, `scripts/check-frozen` (KERNEL.md, INVARIANTS.md and the
+frozen GLOSSARY.md sections keep the bytes pinned in `scripts/frozen.sha256`), and
+`scripts/check-no-poll`. It names no harness.
+`scripts/check-all` runs it, then every `shims/<name>/check` it finds; a shim brings its own
+check and the core gate never changes for it. Nothing lands on main until `scripts/check-all`
+exits 0. Clippy's `all` group is enabled in `Cargo.toml` `[lints.clippy]`; the gate turns
+those warnings into errors.
 
 ## Review rules
 
@@ -23,13 +25,14 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
 3. **Opaque integers stay opaque.** Nothing in `src/` compares, branches on, ranks,
    looks up by, or names the integers in a Reference or on a session. They pass
    through byte-identical. `scripts/acceptance references` is the check.
-4. **No harness in the core.** The core names no harness, reads no harness store, and
-   `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
-   file outside `shims/`, `VECTORS/`, and `docs/reviews/` (historical review evidence):
-   source, tests, scripts, deploy units, and
-   docs (`README.md` and `deploy/README.md` included); `scripts/acceptance` alone is
-   exempt, since proofs 2 and 5 run real harnesses by definition.
-   `scripts/check-harness-free` is the check.
+4. **No harness in the core.** The core names no harness or model, reads no harness store,
+   and `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
+   file in the checkout, tracked or untracked but not ignored, outside `shims/`, `VECTORS/`, and
+   `docs/reviews/` (historical review evidence): source, tests, scripts, deploy units, and
+   docs (`README.md` and `deploy/README.md` included). Exempt are markdown frontmatter
+   (`agent:`, `session:` record who wrote a file), `scripts/acceptance`, since proofs 2 and
+   5 run real harnesses by definition, and `scripts/check-harness-free`, which holds the
+   list of names. `scripts/check-harness-free` is the check.
 5. **No workflow.** The core stores and routes; it never decides what work exists or
    who takes it.
 

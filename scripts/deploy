@@ -15,15 +15,17 @@
 #   the target's env is that machine's own `hostname`, never <host>: an ssh
 #   alias names the route, the hostname names the machine.
 #   ROGER_BIND (first run only) is the address the coordinator listens on and
-#   every host daemon dials; the default is this host's tailnet IPv4, port 7477. Hosts need lingering
-#   enabled (loginctl enable-linger) for the units to start at boot.
+#   every host daemon dials. Required on first run: an explicit address:port.
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_FILE="$HOME/.config/roger/env"
 SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
 die() { echo "FAIL deploy: $*" >&2; exit 1; }
-[[ $# -ge 1 && $# -le 2 ]] || { echo "usage: $0 <host> [commit]" >&2; exit 2; }
+usage() { echo "usage: $0 <host> [commit] (default: HEAD); first run requires ROGER_BIND=address:port"; }
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
+[[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 2; }
 host="$1"
+[[ "$host" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || die "invalid SSH destination: $host"
 commit="$(git -C "$ROOT" rev-parse --verify "${2:-HEAD}^{commit}")"
 self="$(hostname)"
 local_run=0
@@ -36,8 +38,8 @@ put() { # put <src> <dest under target home>
 
 # The token is made once, on the coordinator host, and never rotated here.
 if [[ ! -f "$ENV_FILE" ]]; then
-  bind="${ROGER_BIND:-$(tailscale ip -4 2>/dev/null | head -n1):7477}"
-  [[ "$bind" != :* ]] || die "set ROGER_BIND: no tailnet IPv4 for a default"
+  bind="${ROGER_BIND:-}"
+  [[ -n "$bind" ]] || die "set ROGER_BIND=address:port to an address reachable by every host"
   mkdir -p "$(dirname "$ENV_FILE")"
   (umask 077; printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' \
     "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" "$bind" "$self" >"$ENV_FILE")
@@ -65,7 +67,7 @@ echo "deploy $host: host id $host_id commit $commit sha256 $sum"
 units=(roger-daemon.service)
 if ((local_run)); then units=(roger-coordinator.service roger-daemon.service); fi
 {
-  echo 'set -e; umask 077; mkdir -p ~/.config/roger ~/.local/bin ~/.local/share/roger ~/.config/systemd/user'
+  echo 'set -euo pipefail; umask 077; mkdir -p ~/.config/roger ~/.local/bin ~/.local/share/roger ~/.config/systemd/user'
   echo 'cat > ~/.config/roger/env.new <<"ENV"'
   printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' "$token" "$coord" "$host_id"
   echo 'ENV'
@@ -76,7 +78,7 @@ put "$work/deployed" .local/share/roger/deployed 0644 || die "copy record to $ho
 for u in "${units[@]}"; do put "$ROOT/deploy/$u" ".config/systemd/user/$u" 0644 || die "copy $u to $host"; done
 
 on <<EOF || die "start units on $host"
-set -e
+set -euo pipefail
 cd ~/.local/bin
 chmod 0755 roger.new
 if [ -f roger ] && ! cmp -s roger roger.new; then cp -p roger roger.prev; fi
@@ -93,7 +95,6 @@ for i in \$(seq 50); do
   sleep 0.2
 done
 for u in ${units[*]}; do echo "$host \$u: \$(systemctl --user is-active "\$u")"; done
-echo "$host linger: \$(loginctl show-user "\$(id -un)" -p Linger --value)"
 [ \$ok = 1 ]
 EOF
 echo "PASS deploy $host $commit"
