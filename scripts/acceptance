@@ -1,0 +1,1089 @@
+#!/usr/bin/env bash
+# Acceptance checks named by KERNEL.md proofs.
+# Usage: scripts/acceptance <cross-host|no-poll|independence|pi-shim|claims|references|broadcast|wake>
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# A shell that loaded a live host's env must not hand its token, coordinator
+# or socket to anything started here: every phase sets its own, under $work.
+unset ROGER_TOKEN ROGER_COORDINATOR ROGER_HOST_ID ROGER_BIN ROGER_SOCKET ROGER_STORE ROGER_SESSION
+REMOTE_HOST="${ROGER_REMOTE_HOST:-}"
+SENDER="11111111-1111-4111-8111-111111111111"
+RECIPIENT="22222222-2222-4222-8222-222222222222"
+CLAUDE="33333333-3333-4333-8333-333333333333"
+
+# Cleanup runs from the EXIT trap, outside any function scope, so these are
+# script globals rather than locals.
+coord_pid=""
+daemon_pid=""
+work=""
+remote_work=""
+pids=()
+
+cleanup() {
+  local p
+  for p in "$coord_pid" "$daemon_pid" ${pids[@]+"${pids[@]}"}; do
+    [[ -n "$p" ]] && kill "$p" 2>/dev/null || true
+  done
+  if [[ -n "$remote_work" ]]; then
+    ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" \
+      "bash -lc 'for f in ${remote_work}/*.pid; do [ -f \"\$f\" ] && kill \"\$(cat \"\$f\")\" 2>/dev/null; done; sleep 0.3; rm -rf $remote_work; exit 0'" \
+      >/dev/null 2>&1 || true
+  fi
+  [[ -n "$work" ]] && rm -rf "$work" || true
+}
+
+fail() { echo "FAIL: $*" >&2; exit 1; }
+
+wait_for() { # wait_for <seconds> <description> <command...>
+  local deadline=$(( $(date +%s) + $1 )); shift
+  local what="$1"; shift
+  while (( $(date +%s) < deadline )); do
+    if "$@" >/dev/null 2>&1; then return 0; fi
+    sleep 0.2
+  done
+  fail "timed out waiting for: $what"
+}
+
+# Start a detached process on the remote host and record its pid.
+remote_spawn() { # remote_spawn <pid-file-name> <stdout-file> <args...>
+  local pid_name="$1" out="$2"; shift 2
+  local args="$*"
+  ssh -n "$REMOTE_HOST" "bash -lc 'cd $remote_work; ($args >$out 2>&1 </dev/null & echo \$! > $pid_name) ; exit 0'"
+}
+
+# Two-host core shared by the cross-host checks: build, then a coordinator on
+# ROGER_ACCEPT_BIND IPv4 address, a host daemon here ($work/a.sock)
+# and one on $REMOTE_HOST ($remote_work/b.sock). Each daemon's
+# Host id is its machine's own `hostname`, as scripts/deploy sets it; the ssh
+# alias in $REMOTE_HOST names the route, not the host. Sets globals bin, work,
+# remote_work, coord, local_host_id, remote_host_id.
+two_host_stack() {
+  [[ -n "$REMOTE_HOST" ]] || fail "set ROGER_REMOTE_HOST to the remote SSH destination"
+  [[ "$REMOTE_HOST" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || fail "invalid ROGER_REMOTE_HOST"
+  local ts_ip="${ROGER_ACCEPT_BIND:-}"
+  [[ "$ts_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "set ROGER_ACCEPT_BIND to this host's IPv4 address reachable from the remote host"
+
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
+  bin="$ROOT/target/release/roger"
+
+  local token
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  remote_work="/tmp/roger-accept.$$"
+  local_host_id="$(hostname)"
+  remote_host_id="$(ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" hostname)" || fail "ssh hostname on $REMOTE_HOST"
+  [[ "$local_host_id" =~ ^[A-Za-z0-9._-]+$ && "$remote_host_id" =~ ^[A-Za-z0-9._-]+$ ]] || fail "hostname is not a safe host id"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
+
+  trap cleanup EXIT
+
+  "$bin" coordinator --bind "$ts_ip:0" --port-file "$work/port" \
+    --data "$work/coord.log" >"$work/coord.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "coordinator port file" test -s "$work/port"
+  coord="$ts_ip:$(cat "$work/port")"
+
+  "$bin" daemon --coordinator "$coord" \
+    --host-id "$local_host_id" --socket "$work/a.sock" --data "$work/a.log" \
+    >"$work/daemon-a.out" 2>&1 &
+  daemon_pid=$!
+  wait_for 10 "local daemon socket" test -S "$work/a.sock"
+
+  # Clear it first: a directory left by an earlier run that died before its
+  # EXIT trap could satisfy the waits below with nothing running.
+  ssh -n -o ConnectTimeout=5 "$REMOTE_HOST" "bash -lc 'rm -rf $remote_work; mkdir -p $remote_work; exit 0'" \
+    || fail "ssh mkdir on $REMOTE_HOST"
+  scp -q "$bin" "$REMOTE_HOST:$remote_work/roger" || fail "scp binary"
+
+  remote_spawn daemon.pid daemon.out \
+    "ROGER_TOKEN=$token ./roger daemon --coordinator $coord --host-id $remote_host_id --socket $remote_work/b.sock --data $remote_work/b.log" \
+    || fail "start remote daemon"
+  wait_for 15 "remote daemon socket" ssh -n "$REMOTE_HOST" "test -S $remote_work/b.sock"
+}
+
+cross_host() {
+  two_host_stack
+
+  remote_spawn recipient.pid recipient1.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "start remote recipient"
+  wait_for 15 "recipient READY" ssh -n "$REMOTE_HOST" "grep -q READY $remote_work/recipient1.out"
+
+  local body="cross-host proof [[153:Meteor Shower:7]] exactly once"
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail accept-1 --body "$body" | grep -q "ACCEPTED mail=accept-1" || fail "send not accepted"
+
+  # held.marker appears only after the body is fsynced to the recipient's
+  # Store and before the ack leaves. Kill in that window.
+  wait_for 15 "recipient stored and holding before ack" \
+    ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
+  # No `exit 0` here: the remote status must be the kill's, so a pid that no
+  # longer exists fails this check instead of passing silently.
+  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" \
+    || fail "SIGKILL recipient"
+
+  if grep -q '"ev":"receipt"' "$work/coord.log"; then
+    fail "receipt exists before the recipient acked"
+  fi
+
+  remote_spawn recipient.pid recipient2.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "restart remote recipient"
+  wait_for 15 "DELIVERED after restart" \
+    ssh -n "$REMOTE_HOST" "grep -q 'DELIVERED mail=accept-1 record=r-1' $remote_work/recipient2.out"
+
+  local store_lines
+  store_lines="$(ssh -n "$REMOTE_HOST" "wc -l < $remote_work/recipient.store" | tr -d ' ')"
+  [[ "$store_lines" == "1" ]] || fail "recipient Store must hold the body exactly once, found $store_lines lines"
+  ssh -n "$REMOTE_HOST" "grep -qF '$body' $remote_work/recipient.store" \
+    || fail "body not byte-identical in recipient Store"
+
+  [[ "$(grep -c '"ev":"mail","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
+    || fail "coordinator holds a duplicate mail row"
+  [[ "$(grep -c '"ev":"receipt","mail":"accept-1"' "$work/coord.log")" == "1" ]] \
+    || fail "coordinator receipt missing or duplicated"
+  grep -q '"record":"r-1"' "$work/coord.log" || fail "receipt does not name Store record r-1"
+
+  # Both stamps are on the coordinator's clock; the latency spans the kill.
+  local rcpt re
+  rcpt="$("$bin" receipt --socket "$work/a.sock" --mail accept-1)" || fail "roger receipt accept-1"
+  re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+\$"
+  [[ "$rcpt" =~ $re ]] || fail "receipt lacks a stamp: $rcpt"
+
+  echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1 ($rcpt)"
+}
+
+# Proof 2. One coordinator, two host daemons, one client binary, one adapter
+# binary. Two actual harness sessions exchange Mail in both directions:
+#   - Pi (RPC mode; shims/pi/roger.ts) on host-a. A slash command and a
+#     delivery skip the model, so Pi needs no model call.
+#   - Claude Code (`claude -p`; shims/claude/roger-mcp.mjs) on host-b. This
+#     makes ONE REAL model call (haiku, the user's subscription): the model
+#     must call roger_inbox and roger_send. The tool results are read from
+#     Claude's own stream-json output, not from the model's prose.
+# Then the Tracer, a standalone session with no harness, exchanges Mail with
+# Pi as an additional check. Loopback only.
+# Loopback core shared by the checks below: build, then one coordinator and
+# two host daemons (host-a, host-b). Sets globals bin, work, coord, token.
+bin=""
+coord=""
+token=""
+loopback_stack() {
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
+  bin="$ROOT/target/release/roger"
+  local h
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token" # the core reads it from the environment, never argv
+  trap cleanup EXIT
+
+  "$bin" coordinator --bind 127.0.0.1:0 --port-file "$work/port" \
+    --data "$work/coord.log" >"$work/coord.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "coordinator port file" test -s "$work/port"
+  coord="127.0.0.1:$(cat "$work/port")"
+  for h in a b; do
+    "$bin" daemon --coordinator "$coord" --host-id "host-$h" \
+      --socket "$work/$h.sock" --data "$work/$h.log" >"$work/daemon-$h.out" 2>&1 &
+    pids+=("$!")
+    wait_for 10 "daemon $h socket" test -S "$work/$h.sock"
+  done
+}
+
+start_tracer() { # the Tracer: a session with no harness, on host-b
+  "$bin" session --socket "$work/b.sock" --id "$RECIPIENT" --store "$work/tracer.store" \
+    >"$work/tracer.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+}
+
+# Pi in RPC mode on host-a, driven through fd 3. pi_start <tag> <address>
+# <roger-binary> <extension> [pi-args...]; output lands in $work/<tag>.out. A
+# stub <roger-binary> stands in for the adapter only in the pi-shim failure
+# cases. ROGER_WAKE_LATENCY_MS, when set by the caller, reaches the shim.
+pi_out=""
+pi_pid=""
+pi_start() {
+  local tag="$1" addr="$2" rbin="$3" ext="$4"
+  shift 4
+  pi_out="$work/$tag.out"
+  mkfifo "$work/$tag.in"
+  exec 3<>"$work/$tag.in" # read-write: Pi's stdin stays open until pi_stop
+  PI_CODING_AGENT_DIR="$work/pi-agent" ROGER_BIN="$rbin" ROGER_SOCKET="$work/a.sock" \
+    ROGER_SESSION="$addr" ROGER_STORE="$work/$tag.store" \
+    pi --mode rpc --no-session --offline --no-extensions --no-skills --no-context-files \
+      --no-mcp -e "$ext" "$@" <&3 >"$pi_out" 2>"$work/$tag.err" &
+  pi_pid=$!
+  pids+=("$pi_pid")
+  wait_for 30 "pi accepts commands" pi_call get_state '{"type":"get_state"}'
+}
+
+pi_stop() {
+  exec 3>&-
+  kill "$pi_pid" 2>/dev/null || true
+  wait "$pi_pid" 2>/dev/null || true
+}
+
+# pi_call <id-prefix> <command-json>: send one command, succeed when Pi has
+# answered it (the response carries the unique id).
+pi_call() {
+  local id="$1-$RANDOM$RANDOM" cmd="$2"
+  printf '%s\n' "${cmd/\{/\{\"id\":\"$id\",}" >&3
+  local deadline=$(( $(date +%s) + 5 ))
+  while (( $(date +%s) < deadline )); do
+    grep -q "\"id\":\"$id\",\"type\":\"response\"" "$pi_out" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+pi_slash() { pi_call slash "$(jq -cn --arg m "$1" '{type:"prompt",message:$m}')"; }
+
+# A slash command whose handler asks the UI: pi_slash_ui <message> starts it
+# without waiting; pi_ui answers its dialogs; pi_answered waits for the end.
+pi_ui_cmd=""
+pi_slash_ui() {
+  pi_ui_cmd="ui-$RANDOM$RANDOM"
+  jq -cn --arg id "$pi_ui_cmd" --arg m "$1" '{id:$id,type:"prompt",message:$m}' >&3
+}
+pi_answered() { wait_for 10 "Pi answered $pi_ui_cmd" grep -q "\"id\":\"$pi_ui_cmd\",\"type\":\"response\"" "$pi_out"; }
+# pi_ui <method> <jq object of response fields>: answer the oldest unanswered
+# extension_ui_request of <method>.
+pi_ui() {
+  local method="$1" fields="$2" id deadline=$(( $(date +%s) + 10 ))
+  touch "$work/ui.answered"
+  while (( $(date +%s) < deadline )); do
+    id="$(jq -rR --arg m "$method" 'fromjson? | select(.type == "extension_ui_request" and .method == $m) | .id' "$pi_out" \
+      | grep -vxF -f "$work/ui.answered" | head -n1 || true)"
+    if [[ -n "$id" ]]; then
+      echo "$id" >>"$work/ui.answered"
+      jq -cn --arg id "$id" "{type:\"extension_ui_response\",id:\$id} + $fields" >&3
+      return 0
+    fi
+    sleep 0.1
+  done
+  fail "no $method dialog from Pi"
+}
+
+pi_transcript_has() {
+  pi_call msgs '{"type":"get_messages"}' || return 1
+  grep '"command":"get_messages"' "$pi_out" | grep -qF "$1"
+}
+
+log_count() { # log_count <fixed-string> <n> <file>: the file holds exactly n such lines
+  [[ "$(grep -cF -- "$1" "$3")" == "$2" ]]
+}
+
+# Proof 2. One coordinator, two host daemons, one client binary, one adapter
+# binary. Two actual harness sessions exchange Mail in both directions:
+#   - Pi (RPC mode; shims/pi/roger.ts) on host-a. A slash command and a
+#     delivery skip the model, so Pi needs no model call.
+#   - Claude Code (`claude -p`; shims/claude/roger-mcp.mjs) on host-b. This
+#     makes ONE REAL model call (haiku, the user's subscription): the model
+#     must call roger_inbox and roger_send. The evidence is the structure of
+#     Claude's own stream-json: the tool_result paired by tool_use_id with the
+#     roger_inbox call, and the roger_send call's input.
+# Then the Tracer, a standalone session with no harness, exchanges Mail with
+# Pi as an additional check. Loopback only.
+independence() {
+  command -v pi >/dev/null || fail "pi CLI required for the Pi session"
+  command -v claude >/dev/null || fail "claude CLI required for the Claude Code session"
+  command -v node >/dev/null || fail "node required for the Claude Code shim"
+  command -v jq >/dev/null || fail "jq required to read Claude's stream-json"
+  local pi_addr="$SENDER" tracer_addr="$RECIPIENT" claude_addr="$CLAUDE"
+  loopback_stack
+  start_tracer
+  # No model runs in this check, so the Pi session declares no wake: its
+  # deliveries render without starting a turn. Proof 5 (`wake`) covers wake.
+  ROGER_WAKE_LATENCY_MS=off pi_start pi "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts"
+
+  local out_body="pi to tracer [[153:Meteor Shower:7]]"
+  local in_body="tracer to pi [[0:FLEET:0]]"
+
+  # Pi -> Tracer: a slash command the shim handles; no model runs.
+  pi_slash "/roger-send $tracer_addr $out_body" || fail "Pi did not answer /roger-send"
+  wait_for 15 "tracer DELIVERED Pi's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
+  log_count "$out_body" 1 "$work/tracer.store" || fail "tracer Store must hold Pi's body exactly once"
+
+  # Tracer -> Pi: the client, from the tracer's host, addressed to the Pi session.
+  "$bin" send --socket "$work/b.sock" --from "$tracer_addr" --to "$pi_addr" \
+    --mail indep-2 --body "$in_body" | grep -q "ACCEPTED mail=indep-2" || fail "send to Pi not accepted"
+  wait_for 15 "Pi Store holds the tracer's body" grep -qF "$in_body" "$work/pi.store"
+  log_count "$in_body" 1 "$work/pi.store" || fail "Pi Store must hold the tracer's body exactly once"
+  wait_for 15 "Pi transcript shows the mail" pi_transcript_has "$in_body"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn"
+
+  # Pi -> Claude Code: sent while Claude is not running; the Mail stays
+  # pending in the core until Claude's adapter registers.
+  local pi_to_claude="pi to claude [[0:FLEET:0]] 4"
+  local claude_to_pi="claude to pi [[153:Meteor Shower:7]] 5"
+  pi_slash "/roger-send $claude_addr $pi_to_claude" || fail "Pi did not answer /roger-send"
+  wait_for 15 "coordinator accepted Pi's mail for Claude" grep -qF "$pi_to_claude" "$work/coord.log"
+
+  local mcp
+  mcp="$(jq -cn --arg shim "$ROOT/shims/claude/roger-mcp.mjs" --arg bin "$bin" --arg sock "$work/b.sock" \
+    --arg store "$work/claude.store" --arg id "$claude_addr" \
+    '{mcpServers:{roger:{command:"node",args:[$shim],env:{ROGER_BIN:$bin,ROGER_SOCKET:$sock,ROGER_STORE:$store,ROGER_SESSION:$id}}}}')"
+  (cd "$work" && timeout 180 claude -p \
+    "Call the roger_inbox tool once. Then call the roger_send tool with to=$pi_addr and body exactly: $claude_to_pi. Do nothing else." \
+    --model haiku --mcp-config "$mcp" --strict-mcp-config --tools "" \
+    --allowedTools mcp__roger__roger_inbox mcp__roger__roger_send \
+    --no-session-persistence --max-budget-usd 1 \
+    --output-format stream-json --verbose >"$work/claude.out" 2>"$work/claude.err") \
+    || fail "claude -p failed: $(tail -c 500 "$work/claude.err")"
+  jq -es --arg b "$pi_to_claude" '
+      [.[] | select(.type == "assistant") | .message.content[]?
+        | select(.type == "tool_use" and .name == "mcp__roger__roger_inbox") | .id] as $ids
+      | any(.[] | select(.type == "user") | .message.content[]?
+          | select(.type == "tool_result" and (.tool_use_id as $t | $ids | index($t)) != null
+                   and (.content | tostring | contains($b))); .)' \
+    "$work/claude.out" >/dev/null \
+    || fail "no roger_inbox tool_result carrying Pi's body in Claude's stream"
+  jq -es --arg to "$pi_addr" --arg b "$claude_to_pi" '
+      any(.[] | select(.type == "assistant") | .message.content[]?
+          | select(.type == "tool_use" and .name == "mcp__roger__roger_send"
+                   and .input.to == $to and .input.body == $b); .)' \
+    "$work/claude.out" >/dev/null \
+    || fail "Claude did not call roger_send with the expected input"
+  log_count "$pi_to_claude" 1 "$work/claude.store" || fail "Claude's Store must hold Pi's body exactly once"
+  wait_for 15 "Pi Store holds Claude's body" grep -qF "$claude_to_pi" "$work/pi.store"
+  log_count "$claude_to_pi" 1 "$work/pi.store" || fail "Pi Store must hold Claude's body exactly once"
+  wait_for 15 "Pi transcript shows Claude's mail" pi_transcript_has "$claude_to_pi"
+  grep -q '"type":"agent_start"' "$pi_out" && fail "delivery started a turn in Pi"
+
+  # Receipts follow the acks; wait for the observable count, not a delay.
+  wait_for 15 "four receipts at the coordinator" log_count '"ev":"receipt"' 4 "$work/coord.log"
+  log_count '"ev":"mail"' 4 "$work/coord.log" || fail "coordinator must hold exactly four mail rows"
+  log_count '"record":"r-1"' 3 "$work/coord.log" || fail "three receipts must name a recipient's first record r-1"
+  log_count '"record":"r-2"' 1 "$work/coord.log" || fail "Pi's second record must be r-2"
+
+  "$ROOT/scripts/check-harness-free" || fail "core names a harness"
+  echo "PASS independence: Pi and Claude Code sessions exchanged Mail both ways (Claude via one real haiku call), and the Tracer exchanged Mail with Pi, through one coordinator, two host daemons, one client and one adapter binary; each Store holds each body once"
+}
+
+# Pi shim lifecycle, no model and no Claude. Real Pi runtime and real shim;
+# the first two cases substitute a stub for the adapter binary only to make
+# it fail; the last two use the real adapter.
+pi_shim() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  loopback_stack
+  start_tracer
+  local ext="$ROOT/shims/pi/roger.ts"
+
+  # A missing adapter binary: the failure is reported, the harness survives.
+  pi_start missing "$SENDER" "$work/no-such-binary" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "ENOENT reported" grep -q 'roger-send failed: .*ENOENT' "$work/missing.out"
+  pi_call alive '{"type":"get_state"}' || fail "Pi died with a missing adapter binary"
+  pi_stop
+
+  # The adapter dying while a send is pending: the send fails, not hangs.
+  printf '#!/bin/sh\nread line\nexit 3\n' >"$work/dying"
+  chmod +x "$work/dying"
+  pi_start dying "$SENDER" "$work/dying" "$ext"
+  pi_slash "/roger-send $RECIPIENT x" || fail "Pi did not answer /roger-send"
+  wait_for 10 "exit reported for the pending send" grep -q 'roger-send failed: roger adapter exited (3)' "$work/dying.out"
+  pi_stop
+
+  # session_start recurs on new_session: still one adapter on this Store.
+  # A function, so wait_for recounts on every try (a "$(...)" argument would
+  # be expanded once, before the first try).
+  adapters() { pgrep -fc "adapter --socket $work/a.sock" || true; }
+  adapters_are() { [[ "$(adapters)" == "$1" ]]; }
+  pi_start recur "$SENDER" "$bin" "$ext"
+  wait_for 10 "one adapter" adapters_are 1
+  pi_call new1 '{"type":"new_session"}' || fail "new_session unanswered"
+  pi_call new2 '{"type":"new_session"}' || fail "new_session unanswered"
+  adapters_are 1 || fail "session_start left more than one adapter on the Store"
+  pi_stop
+  wait_for 10 "adapter exits with Pi" adapters_are 0
+
+  # The model-facing roger_send tool's callback, invoked directly in the
+  # real Pi runtime (no model call), reaches the Tracer.
+  pi_start tool "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  pi_slash "/call-roger-send $RECIPIENT tool body [[153:Meteor Shower:7]]" || fail "Pi did not answer /call-roger-send"
+  wait_for 15 "tracer received the tool's mail" grep -q "DELIVERED mail=" "$work/tracer.out"
+  log_count "tool body [[153:Meteor Shower:7]]" 1 "$work/tracer.store" || fail "tracer Store must hold the tool's body once"
+
+  # /roger in the same real Pi runtime: label, board, and messaging by
+  # address prefix and by label. ctx.ui.notify text lands in Pi's rpc output.
+  pi_slash "/roger label [[0:FLEET:0]] pi" || fail "Pi did not answer /roger label"
+  wait_for 10 "own label confirmed" grep -qF "$SENDER is now [[0:FLEET:0]] pi" "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -qE "^SESSION address=$SENDER host=host-a connected=true last_seen_ms=[1-9][0-9]* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "board does not show the label set by /roger label: $("$bin" board --socket "$work/a.sock")"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
+  wait_for 10 "tracer label confirmed" grep -qF "$RECIPIENT is now Tracer" "$work/tool.out"
+  # /roger with no args: the Board, then the picker. Pick the tracer, choose
+  # "Set label…", and type a new label; the Board shows it.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"22222222-2222-4222-8222-222222222222 — host host-b — Tracer"}'
+  pi_ui select '{value:"Set label…"}'
+  pi_ui input '{value:"Picked"}'
+  pi_answered
+  wait_for 10 "picker relabel on the Board" sh -c "'$bin' board --socket '$work/b.sock' | grep -q '^SESSION address=$RECIPIENT .* label=Picked\$'"
+  grep -qF "Present sessions (connected or seen within 600s) (2)" "$work/tool.out" || fail "/roger board lacks the present heading"
+  grep -qF "Your host: host-a" "$work/tool.out" || fail "/roger board lacks the own host"
+  grep -qF "$RECIPIENT — host host-b — Tracer" "$work/tool.out" || fail "/roger board lacks the tracer row with its label"
+  grep -qF "$SENDER (you) — host host-a — [[0:FLEET:0]] pi" "$work/tool.out" || fail "/roger board lacks the own row"
+  pi_slash "/roger relabel $RECIPIENT Tracer" || fail "Pi did not answer /roger relabel <address>"
+  pi_slash "/roger ${RECIPIENT:0:8} by prefix [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger <prefix>"
+  wait_for 15 "prefix-addressed mail stored" log_count "by prefix [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  pi_slash "/roger Tracer by label [[0:FLEET:0]]" || fail "Pi did not answer /roger <label>"
+  wait_for 15 "label-addressed mail stored" log_count "by label [[0:FLEET:0]]" 1 "$work/tracer.store"
+  pi_slash "/roger [[0:FLEET:0]] pi by spaced label" || fail "Pi did not answer /roger <label with spaces>"
+  wait_for 15 "spaced-label mail stored" log_count "by spaced label" 1 "$work/tool.store"
+  pi_slash "/roger * broadcast [[153:Meteor Shower:7]]" || fail "Pi did not answer /roger *"
+  wait_for 15 "broadcast stored by the tracer" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tracer.store"
+  wait_for 15 "broadcast stored by Pi" log_count "broadcast [[153:Meteor Shower:7]]" 1 "$work/tool.store"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  wait_for 10 "board all rendered" grep -qF "All registered sessions (2)" "$work/tool.out"
+  pi_slash '/call-roger-tool roger_claim {"key":"[[0:build:0]]","ttl_seconds":60}' || fail "Pi did not answer roger_claim"
+  wait_for 10 "roger_claim granted" grep -qF '"ok\":true' "$work/tool.out"
+  "$bin" board --socket "$work/b.sock" | grep -qF "CLAIM holder=$SENDER " || fail "board lacks the claim taken by roger_claim"
+  # The /roger view shows the claim key JSON-quoted, then its holder verbatim.
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "\\\"[[0:build:0]]\\\" — $SENDER (" "$work/tool.out" || fail "/roger does not show the claim key JSON-quoted with its holder"
+  pi_slash '/call-roger-tool roger_release {"key":"[[0:build:0]]"}' || fail "Pi did not answer roger_release"
+  wait_for 10 "claim released" sh -c "'$bin' board --socket '$work/b.sock' | grep -q 'claims=0'"
+  # A /roger relabel whose target does not resolve says so and changes nothing.
+  pi_slash "/roger relabel zzzz nope" || fail "Pi did not answer /roger relabel <unknown>"
+  wait_for 10 "relabel of an unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  "$bin" board --socket "$work/a.sock" | grep -q "^SESSION address=$SENDER .* label=\[\[0:FLEET:0\]\] pi$" \
+    || fail "/roger relabel <unknown> changed this session's label"
+  # A full Address not on the Board still routes: the core holds the Mail
+  # until that Address registers.
+  local later="55555555-5555-4555-8555-555555555555"
+  pi_slash "/roger $later for whoever registers [[0:FLEET:0]]" || fail "Pi did not answer /roger <absent address>"
+  wait_for 10 "mail to an absent Address accepted" grep -qF "\"to\":\"$later\"" "$work/coord.log"
+  pi_slash "/roger zzzz nope" || fail "Pi did not answer /roger <unknown>"
+  wait_for 10 "unknown target refused" grep -qF 'no session matches \"zzzz\"' "$work/tool.out"
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
+  wait_for 10 "roger_board tool answered" grep -qF '\"label\":\"Tracer\"' "$work/tool.out"
+  grep -qF '\"last_seen_ms\":' "$work/tool.out" || fail "roger_board rows lack last_seen_ms"
+  grep -qF '\"connected\":true' "$work/tool.out" || fail "roger_board rows lack connected"
+  pi_stop
+
+  # Presence is the open connection: with a 1 s window, the idle Tracer stays
+  # in the default /roger view long after its last act, while a session whose
+  # connection closed drops out of it and stays under /roger all.
+  local gone="44444444-4444-4444-8444-444444444444"
+  "$bin" session --socket "$work/b.sock" --id "$gone" --store "$work/gone.store" >"$work/gone.out" 2>&1 &
+  local gone_pid=$!
+  pids+=("$gone_pid")
+  wait_for 10 "short-lived session READY" grep -q READY "$work/gone.out"
+  kill "$gone_pid"
+  wait_for 10 "closed session disconnected" sh -c "'$bin' board --socket '$work/a.sock' | grep -q '^SESSION address=$gone host=host-b connected=false '"
+  ROGER_PRESENCE_WINDOW_MS=1000 pi_start idle "$SENDER" "$bin" "$ROOT/shims/pi/test/call-tool.ts"
+  # Idle past the window: nothing on either side acts for 2 s.
+  sleep 2
+  pi_slash_ui "/roger"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "Present sessions (connected or seen within 1s) (2)" "$work/idle.out" \
+    || fail "/roger default view lost the idle connected session"
+  grep -qF "$RECIPIENT — host host-b — Tracer — connected" "$work/idle.out" || fail "/roger lacks the idle Tracer as connected"
+  grep -qF "$gone" "$work/idle.out" && fail "/roger default view shows a session whose connection closed"
+  pi_slash_ui "/roger all"
+  pi_ui select '{value:"View only (no changes)"}'
+  pi_answered
+  grep -qF "$gone — host host-b — last seen" "$work/idle.out" || fail "/roger all lacks the disconnected session"
+  # roger_board applies the same filter, against the coordinator's clock.
+  pi_slash '/call-roger-tool roger_board {}' || fail "Pi did not answer roger_board"
+  wait_for 10 "roger_board answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 1"
+  grep 'tool result: ' "$work/idle.out" | grep -qF "$gone" && fail "roger_board default view shows a session whose connection closed"
+  grep 'tool result: ' "$work/idle.out" | grep -qF '\"now\":' || fail "roger_board lacks the coordinator's now"
+  pi_slash '/call-roger-tool roger_board {"all":true}' || fail "Pi did not answer roger_board all"
+  wait_for 10 "roger_board all answered" sh -c "grep -c 'tool result: ' '$work/idle.out' | grep -qx 2"
+  grep 'tool result: ' "$work/idle.out" | tail -n1 | grep -qF "$gone" || fail "roger_board all lacks the disconnected session"
+  pi_stop
+
+  echo "PASS pi-shim: missing binary and adapter death reported without hanging or crashing Pi; session_start recurrence leaves one adapter; roger_send tool callback delivered; /roger label and relabel, board (present and all, in /roger and roger_board; an idle connected session stays present past the window, a closed one drops out), address-prefix, label, absent-Address and broadcast targets, and the roger_board, roger_claim and roger_release tools work"
+}
+
+# Proof 4. Two hosts, one coordinator. A local and B remote
+# contend for one key through their own host daemons. Expiry is read from the
+# committed deadline; nothing releases the key and nothing sweeps it.
+CLAIM_KEY="[[0:build:0]]"
+now_ms() { date +%s%3N; }
+local_roger() { "$bin" "$@" --socket "$work/a.sock"; }
+remote_roger() { ssh -n "$REMOTE_HOST" "bash -lc 'cd $remote_work && ./roger $* --socket $remote_work/b.sock'"; }
+
+# expect_claim <want-exit> <want-prefix> <local|remote> <roger args...>
+expect_claim() {
+  local want="$1" prefix="$2" where="$3" out code=0; shift 3
+  out="$("${where}_roger" "$@" --key "$CLAIM_KEY")" || code=$?
+  [[ "$code" == "$want" ]] || fail "$where $1: expected exit $want, saw $code: $out"
+  [[ "$out" == "$prefix"* ]] || fail "$where $1: expected '$prefix...', saw: $out"
+}
+
+# Both hosts' Board shows exactly one claim on the key, held by <owner>.
+board_one_holder() {
+  local owner="$1" where out lines
+  for where in local remote; do
+    out="$("${where}_roger" board)" || fail "$where board read failed"
+    lines="$(grep -F "key=$CLAIM_KEY" <<<"$out" | grep '^CLAIM ' || true)"
+    [[ "$(grep -c . <<<"$lines")" == 1 && "$lines" == "CLAIM holder=$owner "* ]] \
+      || fail "$where board must show one holder $owner, saw: $out"
+  done
+}
+
+# key_free_on_board <local|remote>: that host's Board has no claim on the key.
+# A failed board read is a failure, not a free key.
+key_free_on_board() {
+  local out
+  out="$("${1}_roger" board)" || return 1
+  ! grep -qF "key=$CLAIM_KEY" <<<"$out"
+}
+
+claims() {
+  local a="$SENDER" b="$RECIPIENT" stray="99999999-9999-4999-8999-999999999999" t0 t1 tr
+  two_host_stack
+
+  # A Claim is held by a session: register A locally and B remotely
+  # before either claims. An owner nobody registered is refused.
+  "$bin" session --socket "$work/a.sock" --id "$a" --store "$work/a.store" \
+    >"$work/session-a.out" 2>&1 &
+  pids+=("$!")
+  remote_spawn session-b.pid session-b.out \
+    "./roger session --socket $remote_work/b.sock --id $b --store $remote_work/b.store" \
+    || fail "start remote session $b"
+  wait_for 10 "session $a READY" grep -q READY "$work/session-a.out"
+  wait_for 15 "session $b READY" ssh -n "$REMOTE_HOST" "grep -q READY $remote_work/session-b.out"
+  expect_claim 3 "REFUSED op=acquire reason=\"owner $stray is not a registered session\" " \
+    local claim --owner "$stray" --ttl-ms 4000
+
+  t0="$(now_ms)"
+  expect_claim 0 "CLAIMED op=acquire holder=$a " local claim --owner "$a" --ttl-ms 4000
+  # The first deadline is the coordinator's clock at the acquire plus 4000 ms,
+  # so it lies in [t0+4000, t1+4000]: renew before t0+4000, test past t1+4000.
+  t1="$(now_ms)"
+  expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
+  expect_claim 3 "REFUSED op=renew holder=$a " remote renew --owner "$b" --ttl-ms 60000
+  board_one_holder "$a"
+  local_roger board | grep -q "^SESSION address=$b host=$remote_host_id " \
+    || fail "board must place $b on Host id $remote_host_id"
+
+  tr="$(now_ms)"
+  (( tr < t0 + 4000 )) || fail "too slow: renewal would start after the first deadline"
+  expect_claim 0 "RENEWED op=renew holder=$a " local renew --owner "$a" --ttl-ms 8000
+
+  # Past the first deadline: the renewal holds the key.
+  sleep "$(awk -v ms=$(( t1 + 4500 - $(now_ms) )) 'BEGIN { print (ms > 0 ? ms / 1000 : 0) }')"
+  (( $(now_ms) >= t1 + 4000 )) || fail "woke before the first deadline"
+  expect_claim 3 "REFUSED op=acquire holder=$a " remote claim --owner "$b" --ttl-ms 4000
+  board_one_holder "$a"
+
+  # Past the renewed deadline the key is free: no release, no sweep.
+  wait_for 20 "expiry frees the key" key_free_on_board local
+  (( $(now_ms) >= tr + 8000 )) || fail "key freed before the renewed deadline"
+  key_free_on_board remote || fail "remote board still shows the key after expiry"
+  grep -q '"ev":"release"' "$work/coord.log" && fail "a release event freed the key, not expiry"
+  expect_claim 3 "REFUSED op=renew " local renew --owner "$a" --ttl-ms 8000
+
+  expect_claim 0 "CLAIMED op=acquire holder=$b " remote claim --owner "$b" --ttl-ms 60000
+  expect_claim 3 "REFUSED op=acquire holder=$b " local claim --owner "$a" --ttl-ms 4000
+  board_one_holder "$b"
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS claims: unregistered owner refused, second owner refused across hosts, owner renewed past its first deadline, expiry freed the key with no release or sweep, and the board read from both hosts showed one holder"
+}
+
+# Proof 6: references keep both integers verbatim through send, Store,
+# delivery, and Board; a label change moves a session's display and never its
+# Address or mailbox. Invariant 3: no code in src branches on those integers.
+references() {
+  local meteor='[[153:Meteor Shower:7]]' fleet='[[0:FLEET:0]]'
+  local body="start $meteor then $fleet"
+  local sender_label="$fleet" recipient_label="$meteor" new_label="$fleet relabeled"
+
+  # Invariant 3 source search: nothing in src parses a Reference or inspects a
+  # label beyond carrying it. The patterns are the ways code would read an
+  # integer out of either. Unit-test modules (`#[cfg(test)]` to end of file)
+  # are fixtures, not core, and are skipped.
+  local hits f
+  hits="$(for f in "$ROOT"/src/*.rs; do
+    awk -v f="${f#"$ROOT"/}" '/^#\[cfg\(test\)\]/{exit} {print f":"NR":"$0}' "$f"
+  done | grep -E '\[\[|\blabel\b[^;]*\b(parse|split|cmp|starts_with|strip_prefix|find|trim|chars|bytes|len)\b|\blabel\b[^;]*[=!<>]=' || true)"
+  [[ -z "$hits" ]] || fail "src inspects a Reference or label:"$'\n'"$hits"
+
+  loopback_stack
+  # Sender on host-a, recipient on host-b, each registered with a label.
+  "$bin" session --socket "$work/a.sock" --id "$SENDER" --label "$sender_label" \
+    --store "$work/sender.store" >"$work/sender.out" 2>&1 &
+  pids+=("$!")
+  "$bin" session --socket "$work/b.sock" --id "$RECIPIENT" --label "$recipient_label" \
+    --store "$work/tracer.store" >"$work/tracer.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "sender READY" grep -q READY "$work/sender.out"
+  wait_for 10 "tracer READY" grep -q READY "$work/tracer.out"
+
+  # Send: the body returns from the coordinator's log byte-identical.
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail ref-1 --body "$body" >"$work/send.out" || fail "send refused"
+  wait_for 10 "ref-1 delivered" grep -q 'DELIVERED mail=ref-1' "$work/tracer.out"
+  jq -e --arg b "$body" 'select(.ev == "mail" and .mail == "ref-1") | .body == $b' \
+    "$work/coord.log" >/dev/null || fail "coordinator log body differs from what was sent"
+  # Delivery: the host-b daemon's inbox holds the same bytes.
+  jq -e --arg b "$body" 'select(.ev == "deliver" and .mail == "ref-1") | .body == $b' \
+    "$work/b.log" >/dev/null || fail "host daemon delivery body differs"
+  # Store: the recipient's record holds the same bytes, once.
+  [[ "$(jq -r 'select(.mail == "ref-1") | .body' "$work/tracer.store")" == "$body" ]] \
+    || fail "recipient Store body differs: $(cat "$work/tracer.store")"
+  log_count "$body" 1 "$work/tracer.store" || fail "recipient Store must hold the body once"
+
+  # Board: both hosts read both labels byte-identical. The Board read is
+  # proof 4's `roger board`, one `SESSION address=<a> host=<h> connected=<bool> last_seen_ms=<ms> label=<l>` line
+  # per registered session; the label is the rest of the line after `label=`.
+  board_label() { # board_label <socket> <address>: the label the Board shows
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=[^ ]* connected=[a-z]* last_seen_ms=[0-9]* label=//p"
+  }
+  board_host() { # board_host <socket> <address>
+    "$bin" board --socket "$1" | sed -n "s/^SESSION address=$2 host=\([^ ]*\) .*/\1/p"
+  }
+  local h label
+  for h in a b; do
+    "$bin" board --socket "$work/$h.sock" >"$work/board-$h.out" || fail "board read via host-$h"
+    label="$(board_label "$work/$h.sock" "$SENDER")"
+    [[ "$label" == "$sender_label" ]] || fail "board via host-$h shows sender label '$label'"
+    label="$(board_label "$work/$h.sock" "$RECIPIENT")"
+    [[ "$label" == "$recipient_label" ]] || fail "board via host-$h shows recipient label '$label'"
+    [[ "$(board_host "$work/$h.sock" "$RECIPIENT")" == host-b ]] \
+      || fail "board via host-$h places the recipient on the wrong host"
+  done
+
+  # Relabel the recipient from the other host: display changes, Address and
+  # mailbox do not.
+  "$bin" label --socket "$work/a.sock" --from "$RECIPIENT" --label "$new_label" \
+    >"$work/relabel.out" || fail "relabel refused"
+  label="$(board_label "$work/b.sock" "$RECIPIENT")"
+  [[ "$label" == "$new_label" ]] || fail "board after relabel shows '$label'"
+  [[ "$("$bin" board --socket "$work/b.sock" | grep -c "^SESSION address=$RECIPIENT ")" == 1 ]] \
+    || fail "relabel changed the number of Board rows for the Address"
+  [[ "$(board_host "$work/b.sock" "$RECIPIENT")" == host-b ]] || fail "relabel moved the recipient's host"
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to "$RECIPIENT" \
+    --mail ref-2 --body "after relabel $meteor" >>"$work/send.out" || fail "send after relabel refused"
+  wait_for 10 "ref-2 delivered" grep -q 'DELIVERED mail=ref-2' "$work/tracer.out"
+  log_count "after relabel $meteor" 1 "$work/tracer.store" \
+    || fail "mail to the same Address after relabel must land in the same Store"
+  [[ "$(wc -l <"$work/tracer.store")" == 2 ]] || fail "recipient Store should hold exactly two records"
+
+  # The label survives a coordinator restart with the same bytes.
+  kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
+  "$bin" coordinator --bind "$coord" --data "$work/coord.log" \
+    >"$work/coord2.out" 2>&1 &
+  coord_pid=$!
+  wait_for 10 "board after coordinator restart" "$bin" board --socket "$work/b.sock"
+  label="$(board_label "$work/b.sock" "$RECIPIENT")"
+  [[ "$label" == "$new_label" ]] || fail "board after coordinator restart shows '$label'"
+
+  echo "PASS references: $meteor and $fleet returned byte-identical through send, Store, delivery, and Board; relabel changed display only, same Address, same Store, across a coordinator restart; src inspects no Reference"
+}
+
+# Proof 3. Two hosts, one coordinator. Three registered sessions: the
+# sender's own locally, an idle one remotely, and one remotely
+# that is SIGKILLed between its Store write and its Ack. One
+# broadcast must land in every Store exactly once. "Starts no turn": a session
+# starts a turn only on a wake request, and each session reports the wake
+# request its delivery carried; every broadcast copy must report wake=false.
+IDLE="44444444-4444-4444-8444-444444444444"
+broadcast() {
+  local mail="bcast-1" body="fleet notice [[0:FLEET:0]] to every session"
+  two_host_stack
+
+  "$bin" session --socket "$work/a.sock" --id "$SENDER" --store "$work/sender.store" \
+    >"$work/sender.out" 2>&1 &
+  pids+=("$!")
+  wait_for 10 "sender READY" grep -q READY "$work/sender.out"
+  remote_spawn idle.pid idle.out \
+    "./roger session --socket $remote_work/b.sock --id $IDLE --store $remote_work/idle.store" \
+    || fail "start remote idle session"
+  remote_spawn recipient.pid recipient1.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "start remote recipient"
+  wait_for 15 "three sessions registered at the coordinator" log_count '"ev":"session"' 3 "$work/coord.log"
+
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
+    | grep -q "ACCEPTED mail=$mail" || fail "broadcast not accepted"
+
+  wait_for 15 "recipient stored and holding before ack" \
+    ssh -n "$REMOTE_HOST" "test -f $remote_work/held.marker"
+  ssh -n "$REMOTE_HOST" "bash -lc 'kill -9 \$(cat $remote_work/recipient.pid)'" || fail "SIGKILL recipient"
+  wait_for 15 "receipts from the two live sessions" log_count '"ev":"receipt"' 2 "$work/coord.log"
+  grep -qF "\"mail\":\"$mail/$RECIPIENT\",\"session\"" "$work/coord.log" \
+    && fail "receipt for the killed recipient exists before it acked"
+
+  remote_spawn recipient.pid recipient2.out \
+    "./roger session --socket $remote_work/b.sock --id $RECIPIENT --store $remote_work/recipient.store --hold-before-ack $remote_work/held.marker" \
+    || fail "restart remote recipient"
+  wait_for 15 "DELIVERED after restart" \
+    ssh -n "$REMOTE_HOST" "grep -q 'DELIVERED mail=$mail/$RECIPIENT record=r-1' $remote_work/recipient2.out"
+  wait_for 15 "three receipts" log_count '"ev":"receipt"' 3 "$work/coord.log"
+
+  # A resent broadcast id fans out nothing new.
+  "$bin" send --socket "$work/a.sock" --from "$SENDER" --to '*' --mail "$mail" --body "$body" \
+    | grep -q "ACCEPTED mail=$mail" || fail "resent broadcast not accepted"
+  log_count '"ev":"broadcast"' 1 "$work/coord.log" || fail "coordinator must hold one broadcast event"
+  log_count '"ev":"mail"' 0 "$work/coord.log" || fail "a broadcast must not be stored as directed mail"
+
+  local addr
+  for addr in "$SENDER" "$IDLE" "$RECIPIENT"; do
+    log_count "\"ev\":\"receipt\",\"mail\":\"$mail/$addr\"" 1 "$work/coord.log" \
+      || fail "coordinator must hold exactly one receipt for $addr"
+  done
+
+  local spec store out where
+  for spec in "local sender" "remote idle" "remote recipient"; do
+    read -r where store <<<"$spec"
+    out="${store}.out"; [[ "$store" == recipient ]] && out=recipient1.out
+    if [[ "$where" == local ]]; then
+      log_count "$body" 1 "$work/$store.store" || fail "$store Store must hold the body once"
+      [[ "$(wc -l <"$work/$store.store")" == 1 ]] || fail "$store Store holds extra records"
+      grep -q "^STORED mail=$mail/.* record=r-1 wake=false$" "$work/$out" || fail "$store: delivery carried a wake request"
+    else
+      ssh -n "$REMOTE_HOST" "test \"\$(grep -cF '$body' $remote_work/$store.store)\" = 1 && test \"\$(wc -l <$remote_work/$store.store)\" = 1" \
+        || fail "$store Store on $REMOTE_HOST must hold the body exactly once"
+      ssh -n "$REMOTE_HOST" "grep -q '^STORED mail=$mail/.* record=r-1 wake=false\$' $remote_work/$out" \
+        || fail "$store: delivery carried a wake request"
+    fi
+  done
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS broadcast: one broadcast reached all three registered sessions on both hosts, including an idle one and one SIGKILLed between Store and Ack, exactly once each, every copy without a wake request"
+}
+
+# Proof 5. A Pi session (real Pi runtime and shim, scripted faux model, no
+# network) on host-a declares its wake latency on the Board; the Tracer on
+# host-b sends it directed Mail. Idle: the Mail starts a turn within the
+# declared latency, measured from before the send to the first observation of
+# agent_start. Busy: the same kind of Mail is stored and acked at once (the
+# core's Deliver does not wait), the shim queues it as a follow-up, and Pi
+# hands it to the model only after the busy turn's reply. Then a Broadcast,
+# which carries no wake request, reaches the same idle session and starts no
+# turn. Loopback only.
+pi_events() { # pi_events <event-type> <fixed-string>: count of such event lines
+  grep "^{\"type\":\"$1\"" "$pi_out" | grep -cF -- "$2" || true
+}
+pi_events_at_least() { [[ "$(pi_events "$1" "")" -ge "$2" ]]; } # re-read on every wait_for try
+first_line() { # first_line <event-type> <fixed-string>: line number in $pi_out
+  grep -n "^{\"type\":\"$1\"" "$pi_out" | grep -F -- "$2" | head -n1 | cut -d: -f1
+}
+
+wake() {
+  command -v pi >/dev/null || fail "pi CLI required"
+  command -v jq >/dev/null || fail "jq required"
+  local pi_addr="$SENDER" declared t0 t1 n
+  loopback_stack
+  start_tracer
+  ROGER_WAKE_LATENCY_MS=1500 pi_start wake "$pi_addr" "$bin" "$ROOT/shims/pi/roger.ts" \
+    -e "$ROOT/shims/pi/test/faux-model.ts" --model faux/faux-1
+
+  # The sender reads the recipient's declaration from the Board on its own host.
+  local row="DECLARED address=$pi_addr declared=wake-latency-ms="
+  wait_for 15 "Pi's declaration on the Board" bash -c "'$bin' board --socket '$work/b.sock' | grep -qF '$row'"
+  declared="$("$bin" board --socket "$work/b.sock" | grep -F "$row" | sed 's/.*declared=wake-latency-ms=//')"
+  [[ "$declared" =~ ^[0-9]+$ ]] || fail "declared wake latency is not a number: '$declared'"
+  [[ "$(pi_events agent_start "")" == 0 ]] || fail "a turn started before any Mail"
+
+  # Idle: the Mail starts a turn within the declared latency.
+  local idle_body="wake while idle [[153:Meteor Shower:7]]"
+  t0="$(now_ms)"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-1 --body "$idle_body" | grep -q "ACCEPTED mail=wake-1" || fail "idle send not accepted"
+  until [[ "$(pi_events agent_start "")" -ge 1 ]]; do
+    (( $(now_ms) - t0 <= declared )) || fail "no turn within the declared ${declared} ms of the idle send"
+    sleep 0.01
+  done
+  t1="$(now_ms)"
+  (( t1 - t0 <= declared )) || fail "turn started $(( t1 - t0 )) ms after the idle send, over the declared ${declared} ms"
+  wait_for 15 "idle wake turn ends" pi_events_at_least agent_end 1
+  [[ "$(pi_events message_end "saw: Mail wake-1 from $RECIPIENT")" == 1 ]] \
+    || fail "the wake turn's model was not given the idle Mail"
+
+  # Busy: a turn holds the model; the Mail is Delivered and acked now, and
+  # reaches the model only at the turn boundary.
+  pi_call busy '{"type":"prompt","message":"busy 4000"}' || fail "busy prompt unanswered"
+  wait_for 10 "busy turn starts" pi_events_at_least agent_start 2
+  local busy_body="wake while busy [[0:FLEET:0]]"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to "$pi_addr" \
+    --mail wake-2 --body "$busy_body" | grep -q "ACCEPTED mail=wake-2" || fail "busy send not accepted"
+  wait_for 10 "busy session's Store holds the Mail" grep -qF "$busy_body" "$work/wake.store"
+  wait_for 10 "receipt while busy" log_count '"ev":"receipt"' 2 "$work/coord.log"
+  [[ "$(pi_events agent_end "")" == 1 ]] || fail "the busy turn ended before the Mail was stored; nothing was proven busy"
+  [[ "$(pi_events message_start '"mail":"wake-2"')" == 0 ]] \
+    || fail "the Mail entered the transcript mid-turn instead of queueing"
+  wait_for 15 "busy turn and its follow-up end" pi_events_at_least agent_end 2
+  local done_at mail_at saw_at
+  done_at="$(first_line message_end '"text":"busy done"')"
+  mail_at="$(first_line message_start '"mail":"wake-2"')"
+  saw_at="$(first_line message_end "saw: Mail wake-2 from $RECIPIENT")"
+  [[ -n "$done_at" && -n "$mail_at" && -n "$saw_at" ]] \
+    || fail "missing busy reply ($done_at), queued Mail ($mail_at), or follow-up reply ($saw_at)"
+  (( done_at < mail_at && mail_at < saw_at )) \
+    || fail "Mail not handed over at the turn boundary: busy reply line $done_at, Mail line $mail_at, follow-up line $saw_at"
+
+  # A Broadcast to the now idle session: shown, stored, acked, no turn.
+  local bcast_body="broadcast to an idle Pi [[0:FLEET:0]]" starts
+  starts="$(pi_events agent_start "")"
+  "$bin" send --socket "$work/b.sock" --from "$RECIPIENT" --to '*' \
+    --mail bcast-1 --body "$bcast_body" | grep -q "ACCEPTED mail=bcast-1" || fail "broadcast not accepted"
+  wait_for 10 "Pi Store holds the broadcast" grep -qF "$bcast_body" "$work/wake.store"
+  wait_for 10 "Pi transcript shows the broadcast" pi_transcript_has "$bcast_body"
+  wait_for 10 "broadcast receipts" log_count '"ev":"receipt"' 4 "$work/coord.log"
+  [[ "$(pi_events agent_start "")" == "$starts" ]] || fail "a broadcast started a turn"
+
+  # Exactly once, end to end.
+  for n in 1 2; do
+    [[ "$(pi_events message_end "\"mail\":\"wake-$n\"")" == 1 ]] || fail "Pi transcript must show wake-$n once"
+  done
+  log_count "$idle_body" 1 "$work/wake.store" || fail "Store must hold the idle body once"
+  log_count "$busy_body" 1 "$work/wake.store" || fail "Store must hold the busy body once"
+  log_count '"ev":"mail"' 2 "$work/coord.log" || fail "coordinator must hold exactly two mail rows"
+  log_count "$bcast_body" 1 "$work/wake.store" || fail "Store must hold the broadcast once"
+  log_count '"ev":"receipt"' 4 "$work/coord.log" || fail "coordinator must hold two directed and two broadcast receipts"
+  pi_stop
+
+  "$ROOT/scripts/check-harness-free" >/dev/null || fail "core names a harness"
+  echo "PASS wake: idle Pi session started a turn $(( t1 - t0 )) ms after directed Mail (declared ${declared} ms on the Board); busy session stored and acked the same Mail at once and handed it to the model at the turn boundary; a broadcast to the idle session started no turn; each Mail stored, acked, and shown once"
+}
+
+# Invariant 2: no fixed-interval scan on the correctness path. Mail, receipts,
+# claim expiry and unregister follow committed events, with every sweep
+# disabled. The core has no sweep to disable: nothing in src runs on a timer
+# (scripts/check-no-poll finds only the daemon's reconnect backoff, the
+# daemon's bounded wait for one upstream reply, and the Store lock's single
+# try). A sweep added later must take a switch that this check turns off; the
+# idle windows below fail while one runs, since they require that nothing is
+# committed while nobody asks.
+#
+# Each phase isolates event triggers, so removing any one of them fails it:
+#   directed  coordinator push on a committed send; host daemon push on a
+#             committed deliver; host daemon forwarding an ack upstream
+#   broadcast coordinator push of each committed copy
+#   register  coordinator push of pending mail on a session's Register
+#   hello     coordinator push of a host's pending mail on its daemon's hello
+#   claims    expiry read from the committed deadline at the next request
+#   leave     explicit unregister; a session connection closing; a host
+#             daemon link dropping; expiry read at Broadcast, claim, relabel
+#             and Board
+#   offline   host daemon push from its inbox on a Register while the
+#             coordinator is down; receipt replay on the next hello
+# Every host daemon still running when the coordinator comes back is a fresh
+# process, so the reconnect backoff never carries a result. Loopback only.
+NP_GRACE_MS=2000
+NP_LINK_LOST='upstream (error|connection closed)' # what a host daemon prints before it reconnects
+no_poll() {
+  command -v jq >/dev/null || fail "jq required"
+  "$ROOT/scripts/check-no-poll" >/dev/null || fail "scripts/check-no-poll found an unmarked timed wait in src"
+  (cd "$ROOT" && cargo build --release --offline -q --features test-hooks) || fail "cargo build"
+  bin="$ROOT/target/release/roger"
+  work="$(mktemp -d /tmp/roger-accept.XXXXXX)"
+  token="$(head -c16 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  export ROGER_TOKEN="$token"
+  trap cleanup EXIT
+
+  local r="$RECIPIENT" l="55555555-5555-4555-8555-555555555555"
+  local x="66666666-6666-4666-8666-666666666666" e="77777777-7777-4777-8777-777777777777"
+  local r_pid l_pid lines i d pid reader
+  declare -A dpid=()
+
+  coordinator_start() { # coordinator_start <bind> <out>
+    "$bin" coordinator --bind "$1" --port-file "$work/port" --data "$work/coord.log" \
+      --unregister-after-ms "$NP_GRACE_MS" >"$work/$2" 2>&1 &
+    coord_pid=$!
+    wait_for 10 "coordinator listening ($2)" grep -q 'coordinator listening' "$work/$2"
+  }
+  daemon_start() { # daemon_start <h> <generation>; sets dpid[<h>]
+    "$bin" daemon --coordinator "$coord" --host-id "host-$1" --socket "$work/$1.sock" \
+      --data "$work/$1.log" >"$work/daemon-$1$2.out" 2>&1 &
+    dpid[$1]=$!
+    pids+=("${dpid[$1]}")
+    wait_for 10 "daemon $1$2 socket" test -S "$work/$1.sock"
+  }
+  daemon_stop() { kill -9 "${dpid[$1]}" 2>/dev/null; wait "${dpid[$1]}" 2>/dev/null || true; }
+  tracer() { # tracer <h> <address> <name>: start a Tracer; sets tracer_pid
+    "$bin" session --socket "$work/$1.sock" --id "$2" --store "$work/$3.store" >>"$work/$3.out" 2>&1 &
+    tracer_pid=$!
+    pids+=("$tracer_pid")
+  }
+  registered() { grep -qF "\"ev\":\"session\",\"session\":\"$1\"" "$work/coord.log"; }
+  unregistered() { grep -qF "\"ev\":\"unregister\",\"session\":\"$1\"" "$work/coord.log"; }
+  receipt() { grep -qF "\"ev\":\"receipt\",\"mail\":\"$1\"" "$work/coord.log"; }
+  send() { # send <h> <to> <mail> <body>
+    "$bin" send --socket "$work/$1.sock" --from "$SENDER" --to "$2" --mail "$3" --body "$4" \
+      | grep -q "ACCEPTED mail=$3" || fail "send $3 not accepted"
+  }
+  # idle <ms> <why>: nobody asks for <ms>; no log in the core may grow.
+  idle() {
+    local before after
+    before="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
+    sleep "$(awk -v ms="$1" 'BEGIN { print ms / 1000 }')"
+    after="$(cat "$work"/coord.log "$work"/?.log | wc -l)"
+    [[ "$before" == "$after" ]] || fail "$2: a log grew from $before to $after lines while nobody asked"
+  }
+
+  coordinator_start 127.0.0.1:0 coord1.out
+  coord="127.0.0.1:$(cat "$work/port")"
+  daemon_start a 1
+  daemon_start b 1
+
+  # directed: R is connected on host-b; a send from host-a reaches its Store,
+  # and its ack becomes a receipt at the coordinator.
+  tracer b "$r" r; r_pid=$tracer_pid
+  wait_for 10 "R registered" registered "$r"
+  send a "$r" np-1 "directed [[0:FLEET:0]]"
+  wait_for 10 "directed: np-1 delivered to a connected session" grep -q 'DELIVERED mail=np-1 record=r-1' "$work/r.out"
+  wait_for 10 "directed: receipt for np-1 at the coordinator" receipt np-1
+
+  # broadcast: the committed copy is pushed to the connected session.
+  send a '*' np-b1 "broadcast [[0:FLEET:0]]"
+  wait_for 10 "broadcast: copy stored without wake" grep -q "STORED mail=np-b1/$r record=r-2 wake=false" "$work/r.out"
+  wait_for 10 "broadcast: receipt for the copy" receipt "np-b1/$r"
+
+  # register: mail for an Address no host daemon has seen waits at the
+  # coordinator until that Address registers.
+  send a "$l" np-2 "before register [[153:Meteor Shower:7]]"
+  grep -qF '"mail":"np-2"' "$work/a.log" && fail "register: np-2 reached a host daemon before its recipient registered"
+  tracer a "$l" l; l_pid=$tracer_pid
+  wait_for 10 "register: np-2 delivered on Register" grep -q 'DELIVERED mail=np-2 record=r-1' "$work/l.out"
+  wait_for 10 "register: receipt for np-2" receipt np-2
+
+  # hello: mail for a host whose daemon is down reaches that daemon's inbox
+  # on its hello, before any session registers there.
+  daemon_stop a
+  wait "$l_pid" 2>/dev/null || true
+  send b "$l" np-3 "while host-a is down"
+  daemon_start a 2
+  wait_for 10 "hello: np-3 in host-a's inbox with no session registered" grep -qF '"ev":"deliver","mail":"np-3"' "$work/a.log"
+  tracer a "$l" l; l_pid=$tracer_pid
+  wait_for 10 "hello: np-3 delivered" grep -q 'DELIVERED mail=np-3 record=r-2' "$work/l.out"
+  wait_for 10 "hello: receipt for np-3" receipt np-3
+
+  # claims: expiry is read from the committed deadline at the next request.
+  local key="[[0:np:0]]" out
+  out="$("$bin" claim --socket "$work/a.sock" --owner "$l" --key "$key" --ttl-ms 1500)" \
+    || fail "claims: L's acquire refused: $out"
+  out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
+    && fail "claims: a second owner took a held key: $out"
+  idle 2000 "claims: past the deadline"
+  out="$("$bin" claim --socket "$work/b.sock" --owner "$r" --key "$key" --ttl-ms 60000)" \
+    || fail "claims: the key was not free at the first request after its deadline: $out"
+  [[ "$out" == "CLAIMED op=acquire holder=$r "* ]] || fail "claims: expected R to hold the key, saw: $out"
+  grep -q '"ev":"release"' "$work/coord.log" && fail "claims: a release freed the key, not expiry"
+
+  # leave, explicit: an adapter whose stdin closes unregisters at once, with
+  # no registered-set read to do it.
+  mkfifo "$work/x.in"
+  "$bin" adapter --socket "$work/b.sock" --id "$x" --store "$work/x.store" <"$work/x.in" >"$work/x.out" 2>&1 &
+  pids+=("$!")
+  exec 4>"$work/x.in"
+  wait_for 10 "leave: X registered" registered "$x"
+  exec 4>&-
+  wait_for 10 "leave: X unregistered on stdin EOF" unregistered "$x"
+
+  # leave, by grace: a session whose connection closed is unregistered by the
+  # first registered-set read after the grace, by each kind of read, and by
+  # nothing before it.
+  i=0
+  for reader in broadcast claim relabel board; do
+    i=$((i + 1))
+    d="8888888${i}-8888-4888-8888-88888888888${i}"
+    tracer b "$d" "d$i"; pid=$tracer_pid
+    wait_for 10 "leave: D$i registered" registered "$d"
+    kill -9 "$pid"; wait "$pid" 2>/dev/null || true
+    idle $((NP_GRACE_MS + 700)) "leave: D$i past its grace"
+    unregistered "$d" && fail "leave: D$i unregistered with no read"
+    case "$reader" in
+      broadcast) send a '*' np-b2 "after a grace"
+        wait_for 10 "leave: np-b2 receipts" receipt "np-b2/$r"
+        wait_for 10 "leave: np-b2 receipts" receipt "np-b2/$l" ;;
+      claim) "$bin" claim --socket "$work/a.sock" --owner "$l" --key "[[1:np:1]]" --ttl-ms 60000 >/dev/null \
+        || fail "leave: L's claim refused" ;;
+      relabel) "$bin" label --socket "$work/a.sock" --from "$l" --label "[[0:FLEET:0]] L" >/dev/null \
+        || fail "leave: relabel refused" ;;
+      board) "$bin" board --socket "$work/a.sock" >"$work/board.out" || fail "leave: board read failed" ;;
+    esac
+    unregistered "$d" || fail "leave: D$i not unregistered by the first $reader after its grace (its connection closed, or that read does not expire)"
+  done
+  jq -e --arg d "88888881-8888-4888-8888-888888888881" --arg r "$r" --arg l "$l" \
+    'select(.ev == "broadcast" and .mail == "np-b2") | .to | (any(. == $d) | not) and any(. == $r) and any(. == $l)' \
+    "$work/coord.log" >/dev/null || fail "leave: np-b2 went to an expired session or missed a live one"
+  grep -q '^SESSION address=8888888' "$work/board.out" && fail "leave: the Board shows an expired session"
+  for d in "$r" "$l"; do
+    grep -q "^SESSION address=$d .*connected=true" "$work/board.out" || fail "leave: connected session $d left the Board"
+  done
+
+  # leave, by a host daemon's link dropping: the daemon dies with its session
+  # and cannot report the disconnect.
+  daemon_start c 1
+  tracer c "$e" e; pid=$tracer_pid
+  wait_for 10 "leave: E registered" registered "$e"
+  daemon_stop c
+  wait "$pid" 2>/dev/null || true
+  idle $((NP_GRACE_MS + 700)) "leave: E past its grace"
+  "$bin" board --socket "$work/a.sock" >"$work/board.out" || fail "leave: board read failed"
+  unregistered "$e" || fail "leave: E not unregistered after its host daemon's link dropped"
+
+  # offline: with the coordinator down, R registers and its host daemon
+  # delivers np-5 from its inbox; the receipt reaches the coordinator on the
+  # next hello.
+  kill -9 "$r_pid"; wait "$r_pid" 2>/dev/null || true
+  send a "$r" np-5 "while R is down"
+  wait_for 10 "offline: np-5 in host-b's inbox" grep -qF '"ev":"deliver","mail":"np-5"' "$work/b.log"
+  # Every host daemon so far kept its first link to the coordinator.
+  grep -qE "$NP_LINK_LOST" "$work"/daemon-*.out && fail "a host daemon lost its link: $(grep -hE "$NP_LINK_LOST" "$work"/daemon-*.out)"
+  kill "$coord_pid"; wait "$coord_pid" 2>/dev/null || true
+  wait_for 10 "offline: host-b saw the coordinator go" grep -qE "$NP_LINK_LOST" "$work/daemon-b1.out"
+  tracer b "$r" r; r_pid=$tracer_pid
+  wait_for 10 "offline: np-5 delivered from host-b's inbox" grep -q 'DELIVERED mail=np-5' "$work/r.out"
+  receipt np-5 && fail "offline: receipt for np-5 with the coordinator down"
+  daemon_stop a
+  daemon_stop b
+  wait "$r_pid" 2>/dev/null || true
+  coordinator_start "$coord" coord2.out
+  daemon_start b 2
+  wait_for 10 "offline: receipt for np-5 replayed on hello" receipt np-5
+
+  # The host daemon running at the end connected at its first try.
+  grep -qE "$NP_LINK_LOST" "$work/daemon-b2.out" && fail "host-b reconnected: $(grep -hE "$NP_LINK_LOST" "$work/daemon-b2.out")"
+
+  # Nothing lost, nothing twice.
+  for m in np-1 np-2 np-3 np-5 "np-b1/$r" "np-b2/$r" "np-b2/$l"; do
+    log_count "\"ev\":\"receipt\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one receipt"
+  done
+  for m in np-1 np-2 np-3 np-5; do
+    log_count "\"ev\":\"mail\",\"mail\":\"$m\"" 1 "$work/coord.log" || fail "$m: expected one mail row"
+  done
+  for m in np-1 np-b1/ np-b2/ np-5; do
+    log_count "\"mail\":\"$m" 1 "$work/r.store" || fail "R's Store must hold $m once"
+  done
+  for m in np-2 np-3 np-b2/; do
+    log_count "\"mail\":\"$m" 1 "$work/l.store" || fail "L's Store must hold $m once"
+  done
+
+  echo "PASS no-poll: with no sweep in the core, directed mail, a broadcast, mail pending at Register and at a host daemon's hello, and mail held in a host daemon's inbox while the coordinator was down were each delivered and acked once; receipts reached the coordinator on the ack and on replay; a claim expired at the first request past its deadline; sessions were unregistered on stdin EOF and, after their grace, by the first Broadcast, claim, relabel and Board read (after a closed connection and a dropped host link); and no log grew while nobody asked"
+}
+
+usage() {
+  echo "usage: $0 <cross-host|no-poll|independence|pi-shim|claims|references|broadcast|wake>"
+  echo "cross-host, claims, broadcast require ROGER_REMOTE_HOST (SSH destination) and"
+  echo "ROGER_ACCEPT_BIND (local IPv4 reachable from that host). Other suites use loopback."
+}
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
+[[ $# == 1 ]] || { usage >&2; exit 2; }
+case "$1" in
+  cross-host) cross_host ;;
+  no-poll) no_poll ;;
+  independence) independence ;;
+  pi-shim) pi_shim ;;
+  claims) claims ;;
+  references) references ;;
+  broadcast) broadcast ;;
+  wake) wake ;;
+  *) usage >&2; exit 2 ;;
+esac

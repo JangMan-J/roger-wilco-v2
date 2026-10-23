@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# The core gate: every change on main passes this before it lands. It names no
+# harness; scripts/check-all adds each shim's own check on top.
+# Usage: scripts/check
+set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run the core gate)"; exit 0; fi
+[[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT"
+
+step() { echo "== $*"; "$@"; }
+
+step cargo fmt --check
+step cargo clippy --offline --all-targets --features test-hooks -- -D warnings
+step cargo test --offline --features test-hooks
+step scripts/check-harness-free
+step scripts/check-frozen
+step scripts/check-no-poll
+echo "PASS check"

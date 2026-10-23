@@ -1,0 +1,14 @@
+[Unit]
+Description=Roger-Wilco coordinator (one per fleet)
+# The bind address may not exist yet at boot; keep retrying until it does.
+StartLimitIntervalSec=0
+
+[Service]
+# Carries ROGER_TOKEN into the environment, where the core reads it; argv shows in ps.
+EnvironmentFile=%h/.config/roger/env
+ExecStart=%h/.local/bin/roger coordinator --bind ${ROGER_COORDINATOR} --data %h/.local/share/roger/coordinator.log
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

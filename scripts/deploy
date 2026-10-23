@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# Install the core on one host and (re)start its user units. Run it on the
+# coordinator host, which holds the token. Idempotent.
+#   binary  ~/.local/bin/roger            (the replaced one is kept as roger.prev)
+#   env     ~/.config/roger/env (0600)    ROGER_TOKEN, ROGER_COORDINATOR, ROGER_HOST_ID
+#   units   ~/.config/systemd/user/roger-daemon.service (every host),
+#           roger-coordinator.service (coordinator host only)
+#   record  ~/.local/share/roger/deployed (commit and sha256 of the binary)
+#   socket  $XDG_RUNTIME_DIR/roger/daemon.sock, served by the host daemon
+# Anything that sits on top of the core (an adapter, a shim, a plain client)
+# installs separately and uses only the binary and the socket.
+#
+# Usage: scripts/deploy <host> [commit]     commit defaults to HEAD
+#   <host> is an ssh destination, or this host's name. The host id written to
+#   the target's env is that machine's own `hostname`, never <host>: an ssh
+#   alias names the route, the hostname names the machine.
+#   ROGER_BIND (first run only) is the address the coordinator listens on and
+#   every host daemon dials. Required on first run: an explicit address:port.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+ENV_FILE="$HOME/.config/roger/env"
+SSH_OPTS=(-o ConnectTimeout=5 -o BatchMode=yes)
+die() { echo "FAIL deploy: $*" >&2; exit 1; }
+usage() { echo "usage: $0 <host> [commit] (default: HEAD); first run requires ROGER_BIND=address:port"; }
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then usage; exit 0; fi
+[[ $# -ge 1 && $# -le 2 ]] || { usage >&2; exit 2; }
+host="$1"
+[[ "$host" =~ ^[A-Za-z0-9_][A-Za-z0-9_.@:-]*$ ]] || die "invalid SSH destination: $host"
+commit="$(git -C "$ROOT" rev-parse --verify "${2:-HEAD}^{commit}")"
+self="$(hostname)"
+local_run=0
+[[ "$host" == "$self" ]] && local_run=1
+on() { if ((local_run)); then bash -s; else timeout 120 ssh "${SSH_OPTS[@]}" "$host" bash -s; fi; }
+put() { # put <src> <dest under target home>
+  if ((local_run)); then install -D -m "$3" "$1" "$HOME/$2"
+  else timeout 120 scp -q "${SSH_OPTS[@]}" "$1" "$host:$2"; fi
+}
+
+# The token is made once, on the coordinator host, and never rotated here.
+if [[ ! -f "$ENV_FILE" ]]; then
+  bind="${ROGER_BIND:-}"
+  [[ -n "$bind" ]] || die "set ROGER_BIND=address:port to an address reachable by every host"
+  mkdir -p "$(dirname "$ENV_FILE")"
+  (umask 077; printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' \
+    "$(od -An -N32 -tx1 /dev/urandom | tr -d ' \n')" "$bind" "$self" >"$ENV_FILE")
+  echo "generated $ENV_FILE"
+fi
+val() { sed -n "s/^$1=//p" "$ENV_FILE"; }
+token="$(val ROGER_TOKEN)"; coord="$(val ROGER_COORDINATOR)"
+[[ -n "$token" && -n "$coord" ]] || die "$ENV_FILE lacks ROGER_TOKEN or ROGER_COORDINATOR"
+
+host_id="$(echo hostname | on)" || die "read hostname on $host"
+[[ "$host_id" =~ ^[A-Za-z0-9._-]+$ ]] || die "hostname on $host is not a host id: '$host_id'"
+
+work="$(mktemp -d "${TMPDIR:-/tmp}/roger-deploy.XXXXXX")"
+trap 'rm -rf "$work"' EXIT
+mkdir "$work/src"
+git -C "$ROOT" archive "$commit" | tar -x -C "$work/src"
+(cd "$work/src" && CARGO_TARGET_DIR="$work/target" RUSTFLAGS="--remap-path-prefix=$work/src=/roger" \
+  cargo build --release --offline -q)
+bin="$work/target/release/roger"
+! grep -q -- --hold-before-ack "$bin" || die "the build carries the test hooks; deploy builds without features"
+sum="$(sha256sum "$bin" | cut -d' ' -f1)"
+printf 'commit=%s\nsha256=%s\n' "$commit" "$sum" >"$work/deployed"
+echo "deploy $host: host id $host_id commit $commit sha256 $sum"
+
+units=(roger-daemon.service)
+if ((local_run)); then units=(roger-coordinator.service roger-daemon.service); fi
+{
+  echo 'set -euo pipefail; umask 077; mkdir -p ~/.config/roger ~/.local/bin ~/.local/share/roger ~/.config/systemd/user'
+  echo 'cat > ~/.config/roger/env.new <<"ENV"'
+  printf 'ROGER_TOKEN=%s\nROGER_COORDINATOR=%s\nROGER_HOST_ID=%s\n' "$token" "$coord" "$host_id"
+  echo 'ENV'
+  echo 'mv -f ~/.config/roger/env.new ~/.config/roger/env'
+} | on || die "write env on $host"
+put "$bin" .local/bin/roger.new 0755 || die "copy binary to $host"
+put "$work/deployed" .local/share/roger/deployed 0644 || die "copy record to $host"
+for u in "${units[@]}"; do put "$ROOT/deploy/$u" ".config/systemd/user/$u" 0644 || die "copy $u to $host"; done
+
+on <<EOF || die "start units on $host"
+set -euo pipefail
+cd ~/.local/bin
+chmod 0755 roger.new
+if [ -f roger ] && ! cmp -s roger roger.new; then cp -p roger roger.prev; fi
+mv -f roger.new roger
+systemctl --user daemon-reload
+systemctl --user enable ${units[*]} >/dev/null 2>&1
+for u in ${units[*]}; do systemctl --user restart "\$u"; done
+ok=0
+for i in \$(seq 50); do
+  ok=1
+  for u in ${units[*]}; do systemctl --user is-active --quiet "\$u" || ok=0; done
+  test -S "\$XDG_RUNTIME_DIR/roger/daemon.sock" || ok=0
+  [ \$ok = 1 ] && break
+  sleep 0.2
+done
+for u in ${units[*]}; do echo "$host \$u: \$(systemctl --user is-active "\$u")"; done
+[ \$ok = 1 ]
+EOF
+echo "PASS deploy $host $commit"

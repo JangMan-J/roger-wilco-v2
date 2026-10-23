@@ -1,0 +1,24 @@
+[package]
+name = "roger-wilco"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+license = "MIT"
+description = "Durable mail, presence, and exclusive work claims between sessions across hosts"
+repository = "https://github.com/JangMan-J/roger-wilco"
+readme = "README.md"
+keywords = ["messaging", "ipc", "coordination", "sessions"]
+categories = ["command-line-utilities", "network-programming"]
+
+[[bin]]
+name = "roger"
+path = "src/main.rs"
+
+[dependencies]
+
+[features]
+# Test-only hooks (`--hold-before-ack`); release and deploy builds leave them out.
+test-hooks = []
+
+[lints.clippy]
+all = "warn"
