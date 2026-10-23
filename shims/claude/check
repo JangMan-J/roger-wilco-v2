@@ -3,5 +3,7 @@
 # scripted adapter; no `claude` binary needed. scripts/acceptance independence
 # drives the real Claude Code.
 set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 (run shim protocol and lifecycle tests)"; exit 0; fi
+[[ $# == 0 ]] || { echo "usage: $0" >&2; exit 2; }
 cd "$(dirname "${BASH_SOURCE[0]}")"
 exec node --test

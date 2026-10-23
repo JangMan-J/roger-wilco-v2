@@ -18,6 +18,7 @@
 #
 # Usage: scripts/check-harness-free [path ...]   (default: the whole core)
 set -euo pipefail
+if [[ "${1:-}" == --help || "${1:-}" == -h ]]; then echo "usage: $0 [path ...] (default: whole core)"; exit 0; fi
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
