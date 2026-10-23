@@ -15,7 +15,7 @@ use std::io;
 #[derive(Clone, Debug, PartialEq)]
 pub struct Held {
     pub owner: String,
-    /// Absolute deadline in coordinator milliseconds since the Unix epoch.
+    /// Absolute deadline in coordinator milliseconds since the Epoch.
     pub expires_ms: i64,
 }
 

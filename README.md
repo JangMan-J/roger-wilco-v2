@@ -81,7 +81,7 @@ Address registers again; a connected session never expires.
 ## Claims
 
 A claim's deadline is `now + ttl_ms` on the coordinator's wall clock, in milliseconds
-since the Unix epoch, and is stored absolute so it survives a restart; a monotonic
+since the Epoch, and is stored absolute so it survives a restart; a monotonic
 clock alone cannot do that. The coordinator therefore trusts its own clock: a forward
 step (NTP, suspend and resume) frees held keys early and a backward step extends them.
 The holder may repeat either grant and land in the same state: `claim` by the current

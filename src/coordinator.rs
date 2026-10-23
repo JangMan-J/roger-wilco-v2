@@ -96,7 +96,7 @@ struct State {
     claims: Claims,
 }
 
-/// Coordinator wall clock in milliseconds since the Unix epoch: the one clock
+/// Coordinator wall clock in milliseconds since the Epoch: the one clock
 /// every claim deadline is set and read against, whichever host asks.
 ///
 /// Deadlines are absolute wall-clock instants because they must survive a
