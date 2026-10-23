@@ -150,10 +150,6 @@ cross_host() {
   rcpt="$("$bin" receipt --socket "$work/a.sock" --mail accept-1)" || fail "roger receipt accept-1"
   re="^RECEIPT mail=accept-1 to=$RECIPIENT record=r-1 accepted_at_ms=[0-9]+ receipted_at_ms=[0-9]+ latency_ms=[0-9]+\$"
   [[ "$rcpt" =~ $re ]] || fail "receipt lacks a stamp: $rcpt"
-  # The Store names its clock by the machine's hostname, which is the remote
-  # daemon's Host id, whatever ssh alias reached it.
-  ssh -n "$REMOTE_HOST" "grep -qF '\"clock\":\"$remote_host_id\"' $remote_work/recipient.store" \
-    || fail "recipient Store clock is not the remote Host id $remote_host_id"
 
   echo "PASS cross-host: mail survived recipient SIGKILL between Store write and ack, delivered exactly once, receipt names r-1 ($rcpt)"
 }

@@ -13,7 +13,7 @@
 # Usage: scripts/deploy <host> [commit]     commit defaults to HEAD
 #   <host> is an ssh destination, or this host's name. The host id written to
 #   the target's env is that machine's own `hostname`, never <host>: an ssh
-#   alias names the route, the hostname names the machine (and its clock).
+#   alias names the route, the hostname names the machine.
 #   ROGER_BIND (first run only) is the address the coordinator listens on and
 #   every host daemon dials; the default is this host's tailnet IPv4, port 7477. Hosts need lingering
 #   enabled (loginctl enable-linger) for the units to start at boot.

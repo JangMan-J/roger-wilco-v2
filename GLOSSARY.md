@@ -1,11 +1,11 @@
 ---
 type: glossary
 created: 2026-10-21T00:15:26Z
-updated: 2026-10-23T05:36:53Z
+updated: 2026-10-23T05:42:19Z
 agent: claude-opus-5-5
 session: 01a165ae-cb97-75ae-af83-749678e1ae5e
 updated_by: claude-opus-5-5
-updated_session: 01a16742-bd84-745e-9487-3ea14d55c325
+updated_session: 01a16746-edb6-75b8-917f-a2de7cf2a17c
 ---
 
 # Roger-Wilco
@@ -196,10 +196,14 @@ _Not_: a disconnect (a disconnected session stays registered until its timeout),
 _Avoid_: deregister, logout
 _Confirmed_: 2026-10-22, Jang ("Unregister is a very reasonable function to add").
 
+**Epoch**:
+The instant 1970-01-01T00:00:00Z, from which the core's clock readings count milliseconds.
+_Confirmed_: 2026-10-23, Jang
+
 **Accepted at**:
-The coordinator's clock in ms since the Unix epoch when it commits a send. Broadcast copies carry it under `<broadcast>/<address>`.
+The coordinator's clock, in milliseconds since the Epoch, when it commits a send. Broadcast copies carry it under `<broadcast>/<address>`.
 _Confirmed_: 2026-10-23, Jang
 
 **Receipted at**:
-The coordinator's clock when it records a Receipt, one per broadcast copy.
+The coordinator's clock, in milliseconds since the Epoch, when it records a Receipt, one per broadcast copy.
 _Confirmed_: 2026-10-23, Jang

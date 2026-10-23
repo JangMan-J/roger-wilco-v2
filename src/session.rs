@@ -164,10 +164,6 @@ fn serve(
         }
     }
     let mut next_record = records.len() as u64 + 1;
-    // Names whose clock `stored_at_ms` was read on.
-    let clock = std::fs::read_to_string("/proc/sys/kernel/hostname")
-        .map(|h| h.trim().to_string())
-        .unwrap_or_default();
 
     let conn = UnixStream::connect(&socket)?;
     let writer = net::writer(Box::new(conn.try_clone()?));
@@ -207,10 +203,6 @@ fn serve(
                             ("mail", s(&mail)),
                             ("from", s(net::field(&v, "from")?)),
                             ("body", s(net::field(&v, "body")?)),
-                            // This host's clock, not the coordinator's: compare
-                            // it only with other stamps from this host.
-                            ("stored_at_ms", Value::Int(local_now_ms())),
-                            ("clock", s(&clock)),
                         ]);
                         store.append(&json::stringify(&entry))?;
                         records.insert(mail.clone(), record.clone());
@@ -364,14 +356,6 @@ fn holder_text(v: &Value) -> String {
         (Ok(h), Some(r)) => format!("holder={h} remaining_ms={r} "),
         _ => String::new(),
     }
-}
-
-/// This host's wall clock in milliseconds since the Unix epoch.
-fn local_now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or(0)
 }
 
 /// The client: one Mail's lifecycle at the coordinator. Prints `RECEIPT` once

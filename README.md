@@ -52,7 +52,7 @@ itself at Register, stored by the core and returned verbatim; `board` prints it 
 
 ## Receipts and latency
 
-The coordinator stamps each Mail twice on its own clock (milliseconds since the Unix epoch):
+The coordinator stamps each Mail twice on its own clock (milliseconds since the Epoch):
 `accepted_at_ms` when it commits the send and answers Accepted, and `receipted_at_ms` when it
 records the Receipt. Both stamps come from one clock, so their difference is end-to-end
 latency with no skew between hosts. Broadcast copies carry the broadcast's `accepted_at_ms`
@@ -61,9 +61,7 @@ by its `<mail>/<address>` id) and prints
 `RECEIPT mail= to= record= accepted_at_ms= receipted_at_ms= latency_ms=` once the recipient
 has acked, else `PENDING mail= to= accepted_at_ms=`; an unknown id exits nonzero. A Mail or
 Receipt committed before the stamps existed replays unchanged and prints `absent`, never 0.
-The recipient's Store entry also records `stored_at_ms` on its own host's clock, with
-`clock` naming that host; compare it only with times from that host. The core reports these
-numbers and does nothing else with them.
+The core reports these numbers and does nothing else with them.
 
 ## Registration
 

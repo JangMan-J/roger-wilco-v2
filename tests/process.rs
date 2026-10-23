@@ -596,7 +596,7 @@ fn references_keep_both_integers_and_relabel_keeps_the_address() {
     let store = read(&rig.p("recipient.store"));
     assert_eq!(store.lines().count(), 1, "{store}");
     assert_eq!(
-        count_lines_with(&store, &format!("\"body\":\"{body}\",")),
+        count_lines_with(&store, &format!("\"body\":\"{body}\"")),
         1,
         "body field verbatim: {store}"
     );
@@ -1898,7 +1898,7 @@ fn stamp_in(line: &str, key: &str) -> i64 {
 /// The coordinator stamps a Mail when it answers Accepted and when it records
 /// the Receipt, on its own clock, so their difference is end-to-end latency.
 /// Directed mail and Broadcast copies are stamped alike, the stamps survive a
-/// coordinator restart, and the Store entry carries its own host's time.
+/// coordinator restart.
 #[test]
 fn receipt_carries_accepted_and_receipted_stamps_on_the_coordinator_clock() {
     let mut rig = Rig::new("ack-time");
@@ -1942,18 +1942,6 @@ fn receipt_carries_accepted_and_receipted_stamps_on_the_coordinator_clock() {
         assert_eq!(stamp_in(&line, "latency_ms"), r - a, "{line}");
         lines.push(line);
     }
-    let store = read(&rig.p("recipient.store"));
-    for entry in store.lines() {
-        let at: i64 = entry
-            .split("\"stored_at_ms\":")
-            .nth(1)
-            .and_then(|r| r.split([',', '}']).next())
-            .and_then(|n| n.parse().ok())
-            .unwrap_or_else(|| panic!("no stored_at_ms in {entry}"));
-        assert!(before <= at && at <= after, "{entry}");
-    }
-    assert_eq!(count_lines_with(&store, "\"clock\":"), 2, "{store}");
-
     // Replay keeps every stamp as committed.
     rig.restart_coordinator();
     let start = Instant::now();
@@ -1973,6 +1961,42 @@ fn receipt_carries_accepted_and_receipted_stamps_on_the_coordinator_clock() {
             std::thread::sleep(Duration::from_millis(50));
         }
     }
+}
+
+/// A Store entry written while entries still carried `stored_at_ms` and
+/// `clock` replays: its Mail keeps its record, and a new entry takes the next
+/// record and carries neither field.
+#[test]
+fn a_store_entry_with_retired_fields_replays() {
+    let mut rig = Rig::new("store-retired-fields");
+    fs::write(
+        rig.p("recipient.store"),
+        format!(
+            "{{\"record\":\"r-1\",\"mail\":\"m-old\",\"from\":\"{SENDER}\",\"body\":\"old\",\"stored_at_ms\":1761000000000,\"clock\":\"old-host\"}}\n"
+        ),
+    )
+    .unwrap();
+    rig.start_stack();
+    rig.start_recipient("recipient1.out", false);
+    rig.send("m-old", "old");
+    rig.send("m-new", "new");
+    for line in [
+        "DELIVERED mail=m-old record=r-1",
+        "DELIVERED mail=m-new record=r-2",
+    ] {
+        wait_for_text(&rig.p("recipient1.out"), line, Duration::from_secs(10));
+    }
+    let store = read(&rig.p("recipient.store"));
+    assert_eq!(count_lines_with(&store, "\"mail\":\"m-old\""), 1, "{store}");
+    let new = store.lines().nth(1).unwrap_or_else(|| panic!("{store}"));
+    assert!(
+        new.contains("\"record\":\"r-2\",\"mail\":\"m-new\""),
+        "{store}"
+    );
+    assert!(
+        !new.contains("stored_at_ms") && !new.contains("\"clock\""),
+        "{new}"
+    );
 }
 
 /// Before its Ack a Mail is pending, with its Accepted stamp only.

@@ -35,9 +35,8 @@ uses.
   argv (README `## Build and test`).
 - `ROGER_COORDINATOR` is the address the coordinator listens on and every host daemon dials.
   On the first run it is `ROGER_BIND` if set, else this host's tailnet IPv4, port 7477.
-- `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the ssh name used to reach it, so a Host
-  id matches the `clock` its Stores record. An ssh alias names the route; the hostname names
-  the machine. Deploy refuses a hostname that is not `[A-Za-z0-9._-]+`.
+- `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the ssh name used to reach it. An ssh
+  alias names the route; the hostname names the machine. Deploy refuses a hostname that is not `[A-Za-z0-9._-]+`.
 
 ## Services
 
