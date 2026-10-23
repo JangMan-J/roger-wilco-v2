@@ -20,7 +20,7 @@ and [INVARIANTS.md](INVARIANTS.md); terms such as Mail, Ack, Store and Board are
 | Core contract: commands, delivery, claims, checks | this file |
 | Deploy: install, services, host config, backups, operations | [deploy/README.md](deploy/README.md) |
 | Shims: one adapter per agent program, each installed separately | `shims/<name>/README.md` |
-| The gate and the review rules | [CODING_STANDARDS.md](CODING_STANDARDS.md) |
+| The gate and the review rules | [AGENTS.md § Coding standards](AGENTS.md#coding-standards) |
 
 ## Requirements
 
@@ -174,8 +174,11 @@ the Store write and the Ack wait for neither.
 
 ## Checks
 
+Every script accepts `--help` (or `-h`) and prints usage without running its work.
+`scripts/acceptance --help` also lists the required cross-host environment variables.
+
 Nothing lands on main until `scripts/check-all` exits 0; what each gate runs and the review
-rules are in [CODING_STANDARDS.md](CODING_STANDARDS.md).
+rules are in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 ```sh
 scripts/check                     # the core gate
@@ -190,15 +193,18 @@ scripts/acceptance wake           # proof 5: directed mail wakes an idle session
 scripts/acceptance references     # proof 6: references keep both integers verbatim; relabel keeps the Address
 ```
 
-`cross-host`, `broadcast` and `claims` run on two hosts: the coordinator binds this host's
-Tailscale IPv4 (the `tailscale` CLI is required), with one host daemon here and one on
-`$ROGER_REMOTE_HOST`, an SSH destination you set, reached with `ssh` and `scp`. They build a
+`cross-host`, `broadcast` and `claims` run on two hosts. Set `ROGER_REMOTE_HOST` to the
+remote SSH destination (no default) and `ROGER_ACCEPT_BIND` to this host's IPv4 address
+reachable from that host. The coordinator binds that address, with one host daemon here
+and one on the remote host, reached with `ssh` and `scp`. For example:
+`ROGER_REMOTE_HOST=<ssh-destination> ROGER_ACCEPT_BIND=<local-ipv4> scripts/acceptance cross-host`.
+They build a
 binary with the test hooks and remove every process and directory they created. The other
 checks run on loopback and need `jq`; what a proof needs from a harness is in that shim's
 README.
 
 What `scripts/check-harness-free` counts as the core, and what it exempts, is review rule 4
-in [CODING_STANDARDS.md](CODING_STANDARDS.md).
+in [AGENTS.md § Coding standards](AGENTS.md#coding-standards).
 
 `scripts/acceptance no-poll` runs the real binaries with no sweep (the core has none; a sweep
 added later needs a switch that this check turns off). Each phase leaves one event trigger as
@@ -213,6 +219,7 @@ core log grows while nobody asks.
 | Path | Role |
 | --- | --- |
 | `KERNEL.md`, `INVARIANTS.md`, `GLOSSARY.md` | the frozen purpose, proofs, invariants and terms |
+| `AGENTS.md` | directives, coding standards and review rules |
 | `src/main.rs` | subcommand dispatch and flags |
 | `src/coordinator.rs` | central durable store; pushes committed mail |
 | `src/claims.rs` | claim decisions; expiry read from each committed deadline, never swept |
@@ -226,3 +233,5 @@ core log grows while nobody asks.
 | `shims/<name>/` | one adapter-fronted shim per harness: README, install, check |
 | `VECTORS/` | the record of what was tried |
 | `docs/reviews/` | historical review evidence |
+
+Licensed under the [MIT License](LICENSE).

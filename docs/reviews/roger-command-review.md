@@ -99,7 +99,7 @@ Verdict: should fix before merge.
 - Verdict: should fix (cheap).
 
 ### 10. LOW: smaller standards and smells
-- `src/session.rs:128`: `unknown request {other}` names what was seen but not what was expected (send|board|relabel|claim). This breaks CODING_STANDARDS "a failure names what was expected and what was seen".
+- `src/session.rs:128`: `unknown request {other}` names what was seen but not what was expected (send|board|relabel|claim). This breaks AGENTS.md § Coding standards "a failure names what was expected and what was seen".
 - Duplicated request-object builders: session.rs:92/100/114.
 - `call-roger-board` (call-tool.ts:49) duplicates `/call-roger-tool roger_board {}`.
 - Completion stops at the first space, so spaced labels such as `[[153:Meteor Shower:7]]` don't complete (:107).

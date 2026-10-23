@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Frozen-set check: KERNEL.md and INVARIANTS.md (whole files) and the
-# `## kernel` and `## invariants` sections of GLOSSARY.md keep the bytes Jang
+# `## kernel` and `## invariants` sections of GLOSSARY.md keep the bytes the owner
 # promoted. Each item's sha256 is pinned in scripts/frozen.sha256. A glossary
 # section runs from its heading to the next `## ` heading, trailing blank lines
 # dropped, so `## Language` additions and frontmatter updates stay allowed.
@@ -30,7 +30,7 @@ while read -r pin name; do
   [[ "$bytes" == . ]] && { echo "FAIL frozen: $name is missing or empty" >&2; status=1; continue; }
   sum="$(printf '%s' "${bytes%.}" | sha256sum | cut -d' ' -f1)"
   if [[ "$sum" != "$pin" ]]; then
-    echo "FAIL frozen: $name changed (sha256 $sum, pinned $pin); only a fork Jang promotes changes it" >&2
+    echo "FAIL frozen: $name changed (sha256 $sum, pinned $pin); only a fork the owner promotes changes it" >&2
     status=1
   fi
 done <scripts/frozen.sha256

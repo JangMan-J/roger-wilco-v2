@@ -2,7 +2,7 @@
 
 - **Reviewed:** commits df2535c and 8c2436b (vector), now on main.
 - **Line numbers:** taken at main `2e98352`. They differ from the original slice where proof 6 or `f559e15` moved code.
-- **Judged against:** KERNEL.md proof 4, INVARIANTS.md (1, 2, 3, 4 and the anti-goals), GLOSSARY.md (Claim, Board) and CODING_STANDARDS.md.
+- **Judged against:** KERNEL.md proof 4, INVARIANTS.md (1, 2, 3, 4 and the anti-goals), GLOSSARY.md (Claim, Board) and AGENTS.md § Coding standards.
 - **Method:** the `review` skill's three axes (fitness, intent-fit, syntactical) ran as separate agents, followed by a direct check of replay, clock use, races and the acceptance script. The review was read-only.
 
 ## Verdict: fix first (proof 4 is already on main, so the fixes go to main)
@@ -91,7 +91,7 @@ Findings 1 to 4 should still be fixed before the next slice builds on claims; th
 - **Why:** a key such as `[[153:Meteor Shower:7]]` therefore sorts by its leading integer's text. That is close to "no code … ranks … them".
 - **Fix:** keep insertion or grant order (for example an index map, or a sequence number on `Held`), or state that the order is unspecified and drop "in key order".
 
-### 10. Low (CODING_STANDARDS "a failure names what was expected and what was seen"): two error strings say neither
+### 10. Low (AGENTS.md § Coding standards "a failure names what was expected and what was seen"): two error strings say neither
 - **Where:** `src/session.rs:256` `"no answer"` and `:260` `.unwrap_or("unexplained")`.
 - **Fix:** `format!("expected one reply line from {}, saw EOF", socket.display())` and `format!("expected a reason in the error reply, saw {}", json::stringify(&reply))`.
 - (The other standards finding from the original slice, the stale usage line, is fixed on main at `src/main.rs:98`.)

@@ -19,6 +19,8 @@ every host including that one. What the core guarantees is in the
 
 ## Install
 
+`scripts/deploy --help` prints usage and the first-run `ROGER_BIND` requirement without deploying.
+
 `scripts/deploy <host> [commit]`, run on the coordinator host, installs the core on `<host>`
 and (re)starts its units. `commit` defaults to `HEAD`; deploy builds it from `git archive`
 with `cargo build --release --offline` and refuses a binary that carries the `test-hooks`
@@ -53,8 +55,8 @@ host:
 - `ROGER_TOKEN`, the fleet token, is generated once, on that first run, and never rotated by
   deploy. The units pass it to the core through `EnvironmentFile=`, never argv.
 - `ROGER_COORDINATOR` is the address the coordinator listens on and every host daemon dials.
-  On the first run it is `ROGER_BIND` if set. Otherwise deploy uses the first address from
-  `tailscale ip -4` with port 7477, and stops with `set ROGER_BIND` when that gives none. To
+  On the first run `ROGER_BIND=address:port` is required; there is no default or automatic
+  address discovery. To
   change it later, edit this file and deploy every host again.
 - `ROGER_HOST_ID` is `<host>`'s own `hostname`, not the SSH name used to reach it: an SSH
   alias names the route, the hostname names the machine. Deploy refuses a hostname that is
