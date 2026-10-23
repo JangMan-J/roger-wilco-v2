@@ -240,7 +240,7 @@ const argvOf = async (s, id) => {
 	throw new Error(`no argv logged; stderr: ${s.stderr()}`);
 };
 const opt = (argv, flag) => argv[argv.indexOf(flag) + 1];
-const SID = "bcbf4c5e-c888-4317-8d21-cadd16846dc1";
+const SID = "33333333-3333-4333-8333-333333333333";
 
 test("defaults: the harness session id is the Address; socket, installed bin and Store follow it", async () => {
 	const s = start(ARGV, { CLAUDE_CODE_SESSION_ID: SID, XDG_RUNTIME_DIR: "/run/x" }, { home: true });

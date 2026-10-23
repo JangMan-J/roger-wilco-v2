@@ -17,6 +17,41 @@ const TOKEN: &str = "process-test-token";
 const SENDER: &str = "11111111-1111-4111-8111-111111111111";
 const RECIPIENT: &str = "22222222-2222-4222-8222-222222222222";
 
+#[test]
+fn cli_help_and_unknown_command() {
+    for flag in ["--help", "-h", "help"] {
+        let output = Command::new(BIN)
+            .arg(flag)
+            .env_remove("ROGER_TOKEN")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let help = String::from_utf8(output.stdout).unwrap();
+        assert!(help.starts_with("Usage: roger"));
+        for command in [
+            "coordinator",
+            "daemon",
+            "session",
+            "adapter",
+            "send",
+            "claim",
+            "renew",
+            "release",
+            "board",
+            "label",
+            "receipt",
+        ] {
+            assert!(help.contains(command));
+        }
+        assert!(output.stderr.is_empty());
+    }
+    let output = Command::new(BIN).arg("unknown-command").output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8(output.stderr)
+        .unwrap()
+        .starts_with("Usage: roger"));
+}
+
 struct Rig {
     dir: PathBuf,
     children: Vec<Child>,

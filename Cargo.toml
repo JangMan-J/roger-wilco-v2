@@ -2,6 +2,11 @@
 name = "roger-wilco"
 version = "0.1.0"
 edition = "2021"
+description = "Durable mail, presence, and exclusive work claims between sessions across hosts"
+repository = "https://github.com/JangMan-J/roger-wilco"
+readme = "README.md"
+keywords = ["messaging", "ipc", "coordination", "sessions"]
+categories = ["command-line-utilities", "network-programming"]
 
 [[bin]]
 name = "roger"

@@ -18,14 +18,34 @@ fn need(args: &[String], name: &str) -> io::Result<String> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, format!("missing {name}")))
 }
 
-/// The fleet token, from the environment: a command line is world-readable
-/// through `ps`, a process's environment is not.
+/// Read the fleet token from the environment to keep it out of command-line listings.
 fn token() -> io::Result<String> {
     std::env::var("ROGER_TOKEN")
         .ok()
         .filter(|t| !t.is_empty())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing ROGER_TOKEN"))
 }
+
+const USAGE: &str = "Usage: roger <command> [flags]
+
+Commands:
+  coordinator --bind <address:port> --data <log>
+              [--port-file <path>] [--unregister-after-ms <ms>]
+  daemon      --coordinator <address:port> --host-id <host> --socket <path> --data <log>
+  session     --socket <path> --store <path> [--id <uuid>] [--label <text>] [--declare <text>]
+  adapter     --socket <path> --store <path> [--id <uuid>] [--label <text>] [--declare <text>]
+  send        --socket <path> --from <uuid> --to <uuid|*> --body <text> [--mail <id>]
+  claim       --socket <path> --owner <uuid> --key <text> --ttl-ms <ms>
+  renew       --socket <path> --owner <uuid> --key <text> --ttl-ms <ms>
+  release     --socket <path> --owner <uuid> --key <text>
+  board       --socket <path> [--from <uuid>]
+  label       --socket <path> --from <uuid> --label <text>
+  receipt     --socket <path> --mail <id>
+
+Set ROGER_TOKEN for coordinator and daemon. Quote '*' to broadcast.
+Session addresses and mail IDs are generated when omitted.
+Claim refusal exits with status 3; an unknown command exits with status 2.
+Use --help or -h for this help.";
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -34,6 +54,10 @@ fn main() -> io::Result<()> {
         let _ = session::HOLD_BEFORE_ACK.set(marker.into());
     }
     let cmd = args.get(1).map(|s| s.as_str()).unwrap_or("");
+    if matches!(cmd, "--help" | "-h" | "help") {
+        println!("{USAGE}");
+        return Ok(());
+    }
     match cmd {
         "coordinator" => coordinator::run(
             &need(&args, "--bind")?,
@@ -125,7 +149,7 @@ fn main() -> io::Result<()> {
             need(&args, "--label")?,
         ),
         _ => {
-            eprintln!("usage: roger <coordinator|daemon|session|adapter|send|claim|renew|release|board|label|receipt> [flags]");
+            eprintln!("{USAGE}");
             std::process::exit(2);
         }
     }
