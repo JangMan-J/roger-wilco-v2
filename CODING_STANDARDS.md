@@ -25,7 +25,8 @@ These are INVARIANTS.md read as rules for a diff. The frozen files win over this
    through byte-identical. `scripts/acceptance references` is the check.
 4. **No harness in the core.** The core names no harness, reads no harness store, and
    `[dependencies]` stays empty. Only `shims/` may know a harness. The core is every
-   file outside `shims/` and `VECTORS/`: source, tests, scripts, deploy units, and
+   file outside `shims/`, `VECTORS/`, and `docs/reviews/` (historical review evidence):
+   source, tests, scripts, deploy units, and
    docs (`README.md` and `deploy/README.md` included); `scripts/acceptance` alone is
    exempt, since proofs 2 and 5 run real harnesses by definition.
    `scripts/check-harness-free` is the check.

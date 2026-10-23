@@ -4,7 +4,7 @@
 # harness store, and link no harness SDK. Only a shim may know.
 #
 # The core is every file in the checkout (tracked or untracked, minus
-# .gitignore) outside shims/ and VECTORS/: source, tests, scripts, deploy
+# .gitignore) outside shims/, VECTORS/, and docs/reviews/: source, tests, scripts, deploy
 # units, and docs, README.md and the whole GLOSSARY.md body included. A model
 # name counts as a harness name. Exempt:
 #   frontmatter         a leading YAML block (--- ... ---) in a markdown file
@@ -12,6 +12,7 @@
 #                       what the core is
 #   shims/              adapters on top of the core; each may know its harness
 #   VECTORS/            the record of what was tried
+#   docs/reviews/       historical review evidence, not core docs
 #   scripts/acceptance  proofs 2 and 5 run real harnesses by definition
 #   scripts/check-harness-free  this list of names
 #
@@ -26,7 +27,7 @@ HARNESSES='pi|claude|claude-code|codex|gemini|cursor|aider|copilot|herdr|zellij|
 MODELS='anthropic|openai|fireworks|opus|sonnet|haiku|gpt|deepseek|llama|qwen|mistral|grok|kimi|glm'
 
 mapfile -t files < <(git ls-files --cached --others --exclude-standard -- "${@:-.}" |
-  grep -vE '^(shims|VECTORS)/|^scripts/(acceptance|check-harness-free)$' | sort -u |
+  grep -vE '^(shims|VECTORS)/|^docs/reviews/|^scripts/(acceptance|check-harness-free)$' | sort -u |
   while IFS= read -r f; do [[ -f "$f" ]] && printf '%s\n' "$f"; done)
 ((${#files[@]})) || { echo "FAIL: no core files under ${*:-.}" >&2; exit 1; }
 
