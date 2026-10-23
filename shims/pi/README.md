@@ -1,8 +1,10 @@
 # Pi shim
 
-A Pi extension (`roger.ts`) that runs `roger adapter` for each Pi session, renders each
-delivered Mail into Pi's transcript, and adds `/roger-send`, `/roger` and the `roger_send`
-tool.
+Connects each Pi session to Roger-Wilco, so it can send and receive Mail, read the Board and
+hold claims, and wakes an idle Pi when directed Mail arrives. The shim is a Pi extension
+(`roger.ts`) that runs `roger adapter` for its session, renders each delivered Mail into
+Pi's transcript, and adds the `/roger` and `/roger-send` commands and the tools
+`roger_send`, `roger_board`, `roger_label`, `roger_claim` and `roger_release`.
 
 ## Install
 
@@ -11,7 +13,8 @@ installs. It needs, per host:
 
 - the `roger` binary at `~/.local/bin/roger` (or on `PATH`)
 - the host daemon listening on `$XDG_RUNTIME_DIR/roger/daemon.sock`
-- `node` and a `pi` CLI on `PATH`
+- a `pi` CLI on `PATH`, and `node` 22.18 or later (the install script and `check` use it;
+  `check` runs the TypeScript tests directly)
 
 Installing or removing it changes nothing in the core or in any other shim.
 
@@ -45,7 +48,9 @@ one.
 
 Any non-empty environment variable overrides its default: `ROGER_SESSION`, `ROGER_SOCKET`,
 `ROGER_BIN`, `ROGER_STORE`, `ROGER_WAKE_LATENCY_MS`, `ROGER_PRESENCE_WINDOW_MS`. The header
-of `roger.ts` describes each one.
+of `roger.ts` describes each one except `ROGER_PRESENCE_WINDOW_MS` (which sessions `/roger`
+and `roger_board` show by default: connected, or seen within the window, default 10
+minutes), described in `roger-command.ts`.
 
 ## Delivery and wake
 
@@ -65,6 +70,7 @@ scripts/acceptance wake           # proof 5: directed mail wakes an idle Pi; bus
 scripts/acceptance independence   # proof 2: this shim is one of the two harnesses
 ```
 
-`scripts/acceptance wake` drives a scripted faux model (`test/faux-model.ts`), so it needs
-`pi` but makes no model call. In `scripts/acceptance independence` Pi runs in RPC mode with
-wake off and makes no model call.
+The three acceptance checks run on loopback and need `pi` and `jq`.
+`scripts/acceptance wake` drives a scripted faux model (`test/faux-model.ts`) and makes no model call. In
+`scripts/acceptance independence` Pi runs in RPC mode with wake off and makes no model
+call; that check also needs the Claude Code shim's requirements.
